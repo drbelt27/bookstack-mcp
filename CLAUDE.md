@@ -193,3 +193,11 @@ The server implements OAuth 2.1 (authorization code + PKCE) with a browser-based
 **Two auth flows:**
 1. **Form-based (primary):** Claude opens /authorize → user enters BookStack API token → server validates → stores credentials with auth code → redirects → code exchange issues access token.
 2. **Legacy Bearer:** `Authorization: Bearer token_id:token_secret` on SSE/messages endpoints (Claude Code direct connection).
+
+## Second Brain (Hindsight)
+
+- Project memory lives in Hindsight bank `bookstack-mcp`; cross-project rules and the skill catalogue live in `claude-code-setup`. Always pass `bank_id` explicitly.
+- On session start: recall `claude-code-setup` for shared rules, then recall `bookstack-mcp` for current state. Prefer the most recent verified entry; never reload an entry marked `deprecato` as active.
+- After a significant change or test: record decisions, fixes and verified results (commit, version, date) in `bookstack-mcp`, then re-read to confirm. Mark replaced facts `deprecato` instead of deleting; delete or invalidate only on explicit user confirmation.
+- Never store secrets, tokens or customer data in memory.
+- Local verification on Windows: `powershell -File .claude\toolchain\run-gate.ps1` runs the same four checks as `verify-pr.yml` (toolchain is project-local, gitignored).
