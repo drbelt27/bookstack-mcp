@@ -3754,12 +3754,13 @@ mod lifecycle_tests {
     fn v0_10_0_migration_drops_briefing_surface() {
         let dir = env::temp_dir();
         let unique = format!(
-            "bsmcp-test-mig-{}-{}.db",
+            "bsmcp-test-mig-{}-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TEMP_DB_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let path = dir.join(&unique);
 
@@ -3888,12 +3889,13 @@ mod lifecycle_tests {
     async fn v0_13_0_migration_drops_indexed_shelves_json_column() {
         let dir = env::temp_dir();
         let unique = format!(
-            "bsmcp-test-mig122-{}-{}.db",
+            "bsmcp-test-mig122-{}-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TEMP_DB_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let path = dir.join(&unique);
 
@@ -3958,12 +3960,13 @@ mod lifecycle_tests {
     async fn v0_13_0_fresh_open_settings_round_trip() {
         let dir = env::temp_dir();
         let unique = format!(
-            "bsmcp-test-mig122-fresh-{}-{}.db",
+            "bsmcp-test-mig122-fresh-{}-{}-{}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            TEMP_DB_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let path = dir.join(&unique);
 

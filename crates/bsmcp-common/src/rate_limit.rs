@@ -5,10 +5,10 @@
 //! cascade through 429s. The limiter caps the local issue rate to whatever
 //! BookStack advertises, with backoff on 429.
 //!
-//! `shared()` is the single entry point used by `BookStackClient`; every call
-//! site picks up the same bucket via `OnceLock` so multi-user fan-out from
-//! the MCP server still respects the per-process budget.
+//! Each BookStackClient uses both `shared()` for the process-wide ceiling and
+//! `for_token()` for fairness across short-lived per-request clients.
 
+use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const DEFAULT_RPM: f64 = 180.0;
+const DEFAULT_PER_TOKEN_RPM: f64 = 60.0;
+
+fn per_token_rpm(value: Option<&str>) -> f64 {
+    value
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(DEFAULT_PER_TOKEN_RPM)
+}
 
 #[derive(Debug)]
 struct Inner {
@@ -34,11 +42,16 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(rpm: f64) -> Self {
+        Self::with_burst(rpm, rpm)
+    }
+
+    fn with_burst(rpm: f64, burst: f64) -> Self {
         let rpm = rpm.max(1.0);
+        let burst = burst.max(rpm);
         Self {
             inner: Arc::new(Mutex::new(Inner {
-                capacity: rpm,
-                tokens: rpm,
+                capacity: burst,
+                tokens: burst,
                 refill_per_sec: rpm / 60.0,
                 last_refill: Instant::now(),
                 observed_limit_rpm: None,
@@ -93,12 +106,10 @@ impl RateLimiter {
             inner.observed_limit_rpm = Some(rpm);
             // Defensive: only ever lower the local cap. If BookStack advertises
             // a higher limit than env-configured, ignore it — env wins.
-            if rpm < inner.capacity {
-                inner.capacity = rpm;
+            if rpm < inner.refill_per_sec * 60.0 {
+                inner.capacity = inner.capacity.min(rpm);
                 inner.refill_per_sec = rpm / 60.0;
-                if inner.tokens > rpm {
-                    inner.tokens = rpm;
-                }
+                inner.tokens = inner.tokens.min(inner.capacity);
             }
         }
     }
@@ -142,9 +153,46 @@ fn refill(inner: &mut Inner) {
 }
 
 static GLOBAL: OnceLock<RateLimiter> = OnceLock::new();
+static PER_TOKEN: OnceLock<std::sync::Mutex<HashMap<String, (RateLimiter, Instant)>>> =
+    OnceLock::new();
 
 pub fn shared() -> RateLimiter {
     GLOBAL.get_or_init(RateLimiter::from_env).clone()
+}
+
+/// A per-token cap shared across short-lived clients in this process. The key
+/// hashes the full credential, so an invalid secret cannot consume another
+/// account's bucket. Idle buckets expire after 10 minutes.
+pub fn for_token(instance: &str, token_id: &str, token_secret: &str) -> RateLimiter {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(instance.as_bytes());
+    hasher.update([0]);
+    hasher.update(token_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(token_secret.as_bytes());
+    let key = format!("{:x}", hasher.finalize());
+    let mut buckets = PER_TOKEN
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap();
+    let now = Instant::now();
+    if let Some((limiter, last_used)) = buckets.get_mut(&key) {
+        *last_used = now;
+        return limiter.clone();
+    }
+    buckets.retain(|_, (limiter, last_used)| {
+        Arc::strong_count(&limiter.inner) > 1
+            || now.duration_since(*last_used) < Duration::from_secs(600)
+    });
+    let rpm = per_token_rpm(
+        env::var("BSMCP_BOOKSTACK_PER_TOKEN_RATE_LIMIT_PER_MIN")
+            .ok()
+            .as_deref(),
+    );
+    let limiter = RateLimiter::with_burst(rpm, rpm.max(90.0));
+    buckets.insert(key, (limiter.clone(), now));
+    limiter
 }
 
 /// Parse a `Retry-After` HTTP header value as integer seconds. Returns
@@ -158,6 +206,107 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn per_token_bucket_is_shared_without_blocking_another_token() {
+        let a = for_token("http://bookstack.test", "reader-a", "secret-a");
+        let same_a = for_token("http://bookstack.test", "reader-a", "secret-a");
+        let b = for_token("http://bookstack.test", "reader-b", "secret-b");
+        for _ in 0..90 {
+            a.acquire().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), same_a.acquire())
+                .await
+                .is_err()
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(10), b.acquire())
+            .await
+            .is_ok());
+        drop(a);
+        drop(same_a);
+        let next_request = for_token("http://bookstack.test", "reader-a", "secret-a");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), next_request.acquire())
+                .await
+                .is_err(),
+            "a new MCP request must not reset the token budget"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn per_token_burst_covers_a_large_acl_search_without_raising_sustained_rate() {
+        let limiter = RateLimiter::with_burst(60.0, 90.0);
+        for _ in 0..90 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), limiter.acquire())
+                    .await
+                    .is_ok()
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), limiter.acquire())
+                .await
+                .is_err()
+        );
+        // `acquire()` starts after the clock advances; refill is calculated
+        // from its last actual acquisition, not from a spawned timer.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let inner = limiter.inner.lock().await;
+        assert!(inner.tokens < 1.0);
+        assert_eq!(inner.capacity, 90.0);
+        assert_eq!(inner.refill_per_sec, 1.0);
+    }
+
+    #[test]
+    fn per_token_rate_accepts_positive_override_only() {
+        assert_eq!(per_token_rpm(Some("180")), 180.0);
+        assert_eq!(per_token_rpm(Some("0")), 60.0);
+        assert_eq!(per_token_rpm(Some("bad")), 60.0);
+        assert_eq!(per_token_rpm(None), 60.0);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn wrong_secret_does_not_drain_the_real_tokens_budget() {
+        let real = for_token("http://same.test", "shared-id", "right-secret");
+        let wrong = for_token("http://same.test", "shared-id", "wrong-secret");
+        for _ in 0..60 {
+            wrong.acquire().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), real.acquire())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn active_sse_bucket_is_not_evicted_when_another_user_connects() {
+        let session = for_token("http://sse.test", "session-id", "secret");
+        tokio::time::advance(Duration::from_secs(601)).await;
+        for_token("http://sse.test", "other-id", "secret");
+        let next_request = for_token("http://sse.test", "session-id", "secret");
+        assert!(
+            Arc::ptr_eq(&session.inner, &next_request.inner),
+            "a live SSE client must retain its original bucket"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn global_bucket_still_caps_distinct_tokens() {
+        let global = RateLimiter::new(2.0);
+        for token in ["first", "second"] {
+            for_token("http://separate.test", token, "secret")
+                .acquire()
+                .await;
+            global.acquire().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), global.acquire())
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn acquire_blocks_when_bucket_empty() {
@@ -200,6 +349,17 @@ mod tests {
         assert_eq!(inner.capacity, 60.0);
         assert!((inner.refill_per_sec - 1.0).abs() < f64::EPSILON);
         assert_eq!(inner.observed_limit_rpm, Some(60.0));
+    }
+
+    #[tokio::test]
+    async fn observed_limit_between_refill_and_burst_never_raises_refill() {
+        let limiter = RateLimiter::with_burst(60.0, 90.0);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-RateLimit-Limit", HeaderValue::from_static("80"));
+        limiter.observe_limit(&headers);
+        let inner = limiter.inner.lock().await;
+        assert_eq!(inner.refill_per_sec, 1.0);
+        assert_eq!(inner.capacity, 90.0);
     }
 
     #[tokio::test]

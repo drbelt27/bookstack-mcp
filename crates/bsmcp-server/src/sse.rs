@@ -21,6 +21,7 @@ use bsmcp_common::bookstack::CredentialCheck;
 use bsmcp_common::db::DbBackend;
 use bsmcp_common::time::TimezoneConfig;
 
+use crate::auth_guard::{credential_key, AuthGuard, Gate};
 use crate::mcp;
 use crate::oauth::{AuthCode, AUTH_CODE_TTL};
 use crate::semantic::SemanticState;
@@ -32,6 +33,8 @@ const DEFAULT_MAX_SESSIONS_PER_TOKEN: usize = 5;
 const MAX_TOTAL_SESSIONS: usize = 1000;
 const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const MAX_REQUESTS_PER_MINUTE: u32 = 100;
+/// Upper bound on per-token request counters kept for unauthenticated ids.
+const MAX_TRACKED_TOKENS: usize = 2_000;
 /// `Retry-After` on a 503 when an upstream is unreachable. Long enough to
 /// cover a container restart, short enough that clients don't stall.
 pub(crate) const RETRY_AFTER_SECS: &str = "5";
@@ -85,6 +88,8 @@ pub struct AppState {
     pub register_rate_limit: Arc<Mutex<RateLimit>>,
     streamable_rate_limits: Arc<RwLock<HashMap<String, Arc<Mutex<RateLimit>>>>>,
     streamable_sessions: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Verdict memory + cap on distinct bad credentials, see `auth_guard`.
+    auth_guard: Arc<AuthGuard>,
     /// Per-token cap on concurrent *legacy* SSE sessions, resolved once at
     /// startup from `BSMCP_MAX_SESSIONS_PER_TOKEN` (issue #138). Streamable
     /// notification streams are deliberately not counted against it.
@@ -176,6 +181,7 @@ impl AppState {
             register_rate_limit: Arc::new(Mutex::new(RateLimit::new(10))),
             streamable_rate_limits: Arc::new(RwLock::new(HashMap::new())),
             streamable_sessions: Arc::new(RwLock::new(HashMap::new())),
+            auth_guard: Arc::new(AuthGuard::new()),
             max_sessions_per_token,
             backup_interval_hours,
             backup_path,
@@ -301,6 +307,64 @@ fn upstream_unavailable(hint: &str) -> Response {
     resp
 }
 
+/// Validate credentials against the backend through the pre-auth guard.
+/// `Ok(())` means the backend accepted them; `Err` is a ready response.
+#[allow(clippy::result_large_err)]
+async fn verify_credentials(
+    state: &AppState,
+    client: &Arc<dyn Backend>,
+    token_id: &str,
+    token_secret: &str,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    let key = credential_key(&state.backend.api_url, token_id, token_secret);
+    match state.auth_guard.admit(&key) {
+        Gate::KnownBad => {
+            return Err(unauthorized(
+                "BookStack credentials are invalid or expired — please re-authenticate",
+                headers,
+                &state.known_urls,
+            ));
+        }
+        Gate::Throttled => {
+            tracing::warn!("auth_guard_throttled_unknown_credential");
+            let mut resp = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "too_many_failed_authentications",
+                    "hint": "Too many invalid credentials were presented recently; retry shortly"
+                })),
+            )
+                .into_response();
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, RETRY_AFTER_SECS.parse().unwrap());
+            return Err(resp);
+        }
+        Gate::Allow => {}
+    }
+    match client.validate().await {
+        CredentialCheck::Valid => {
+            state.auth_guard.record(&key, true);
+            Ok(())
+        }
+        CredentialCheck::Rejected(e) => {
+            tracing::warn!(error = %e, "credential_validation_rejected");
+            state.auth_guard.record(&key, false);
+            Err(unauthorized(
+                "BookStack credentials are invalid or expired — please re-authenticate",
+                headers,
+                &state.known_urls,
+            ))
+        }
+        CredentialCheck::Unavailable(e) => {
+            tracing::warn!(error = %e, "credential_validation_unavailable");
+            Err(upstream_unavailable(
+                "BookStack is unreachable — retry shortly",
+            ))
+        }
+    }
+}
+
 // The Err variant is a ready-to-send HTTP response for the `?` early-return
 // pattern in the handlers; boxing it would push the cost onto every caller.
 #[allow(clippy::result_large_err)]
@@ -408,20 +472,9 @@ pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Re
 
     let client = state.backend_client(&token_id, &token_secret);
 
-    match client.validate().await {
-        CredentialCheck::Valid => {}
-        CredentialCheck::Rejected(e) => {
-            tracing::warn!(error = %e, "credential_validation_rejected");
-            return unauthorized(
-                "BookStack credentials are invalid or expired — please re-authenticate",
-                &headers,
-                &state.known_urls,
-            );
-        }
-        CredentialCheck::Unavailable(e) => {
-            tracing::warn!(error = %e, "credential_validation_unavailable");
-            return upstream_unavailable("BookStack is unreachable — retry shortly");
-        }
+    if let Err(resp) = verify_credentials(&state, &client, &token_id, &token_secret, &headers).await
+    {
+        return resp;
     }
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -632,28 +685,6 @@ pub async fn handle_streamable(
         Err(resp) => return resp,
     };
 
-    {
-        let rate_limits = state.streamable_rate_limits.read().await;
-        if let Some(rl) = rate_limits.get(&token_id) {
-            let mut rl = rl.lock().await;
-            if rl.check().is_err() {
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(serde_json::json!({"error": "Rate limit exceeded"})),
-                )
-                    .into_response();
-            }
-        } else {
-            drop(rate_limits);
-            let mut rate_limits = state.streamable_rate_limits.write().await;
-            let rl = rate_limits
-                .entry(token_id.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(RateLimit::new(MAX_REQUESTS_PER_MINUTE))));
-            let mut rl = rl.lock().await;
-            let _ = rl.check();
-        }
-    }
-
     let client = state.backend_client(&token_id, &token_secret);
 
     let request: Value = match serde_json::from_str(&body) {
@@ -669,21 +700,39 @@ pub async fn handle_streamable(
 
     let method = request["method"].as_str().unwrap_or("");
 
-    if method == "initialize" {
-        match client.validate().await {
-            CredentialCheck::Valid => {}
-            CredentialCheck::Rejected(e) => {
-                tracing::warn!(error = %e, "streamable_credential_validation_rejected");
-                return unauthorized(
-                    "BookStack credentials are invalid or expired — please re-authenticate",
-                    &headers,
-                    &state.known_urls,
-                );
+    // Streamable HTTP has no connection-time handshake to pin credentials.
+    // Validate every request before allocating a counter or handling JSON-RPC.
+    if let Err(resp) = verify_credentials(&state, &client, &token_id, &token_secret, &headers).await
+    {
+        return resp;
+    }
+
+    {
+        let rate_limits = state.streamable_rate_limits.read().await;
+        if let Some(rl) = rate_limits.get(&token_id) {
+            let mut rl = rl.lock().await;
+            if rl.check().is_err() {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({"error": "Rate limit exceeded"})),
+                )
+                    .into_response();
             }
-            CredentialCheck::Unavailable(e) => {
-                tracing::warn!(error = %e, "streamable_credential_validation_unavailable");
-                return upstream_unavailable("BookStack is unreachable — retry shortly");
+        } else {
+            drop(rate_limits);
+            let mut rate_limits = state.streamable_rate_limits.write().await;
+            if rate_limits.len() >= MAX_TRACKED_TOKENS && !rate_limits.contains_key(&token_id) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({"error": "Rate limit exceeded"})),
+                )
+                    .into_response();
             }
+            let rl = rate_limits
+                .entry(token_id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(RateLimit::new(MAX_REQUESTS_PER_MINUTE))));
+            let mut rl = rl.lock().await;
+            let _ = rl.check();
         }
     }
 
@@ -758,6 +807,220 @@ mod tests {
     fn streamable_get_is_detected_by_session_header() {
         let h = headers_with_session("8acb2c83-0d1e-4f4a-9d21-1b2c3d4e5f60");
         assert!(is_streamable_notification_stream(&h));
+    }
+
+    async fn streamable_tools_call(secret: &str) -> StatusCode {
+        use axum::routing::get;
+
+        let app = axum::Router::new().route(
+            "/api/books",
+            get(|headers: HeaderMap| async move {
+                if headers.get("authorization").and_then(|v| v.to_str().ok())
+                    == Some("Token tid:good")
+                {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"data": [], "total": 0})),
+                    )
+                } else {
+                    (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let db = Arc::new(bsmcp_db_sqlite::SqliteDb::open(
+            &std::env::temp_dir().join(format!("bsmcp-sse-{}.db", uuid::Uuid::new_v4())),
+            "test-encryption-key-thirty-two-chars-long",
+        ));
+        let state = AppState::new(
+            BackendConfig::new(BackendKind::BookStack, &base, None),
+            db.clone(),
+            db,
+            Vec::new(),
+            None,
+            PathBuf::new(),
+            None,
+            Arc::new(TimezoneConfig::from_env()),
+            DEFAULT_MAX_SESSIONS_PER_TOKEN,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer tid:{secret}").parse().unwrap(),
+        );
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#;
+        handle_streamable(State(state), headers, body.to_string())
+            .await
+            .status()
+    }
+
+    /// BookStack stand-in that accepts only `tid:good` and counts every
+    /// request it receives, so tests can prove how much traffic invented
+    /// credentials generate upstream.
+    async fn counting_state() -> (AppState, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::routing::get;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let app = axum::Router::new().route(
+            "/api/books",
+            get(move |headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if headers.get("authorization").and_then(|v| v.to_str().ok())
+                        == Some("Token tid:good")
+                    {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({"data": [], "total": 0})),
+                        )
+                    } else {
+                        (StatusCode::UNAUTHORIZED, Json(serde_json::json!({})))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let db = Arc::new(bsmcp_db_sqlite::SqliteDb::open(
+            &std::env::temp_dir().join(format!("bsmcp-sse-{}.db", uuid::Uuid::new_v4())),
+            "test-encryption-key-thirty-two-chars-long",
+        ));
+        let state = AppState::new(
+            BackendConfig::new(BackendKind::BookStack, &base, None),
+            db.clone(),
+            db,
+            Vec::new(),
+            None,
+            PathBuf::new(),
+            None,
+            Arc::new(TimezoneConfig::from_env()),
+            DEFAULT_MAX_SESSIONS_PER_TOKEN,
+        );
+        (state, hits)
+    }
+
+    async fn call_with(state: &AppState, credential: &str) -> StatusCode {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {credential}").parse().unwrap(),
+        );
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}"#;
+        handle_streamable(State(state.clone()), headers, body.to_string())
+            .await
+            .status()
+    }
+
+    #[tokio::test]
+    async fn flood_of_invented_credentials_cannot_drain_the_bookstack_budget() {
+        use std::sync::atomic::Ordering;
+        let (state, hits) = counting_state().await;
+        let mut statuses = Vec::new();
+        for i in 0..80 {
+            statuses.push(call_with(&state, &format!("invented-{i}:nope")).await);
+        }
+        assert!(
+            hits.load(Ordering::SeqCst) <= 30,
+            "invented credentials reached BookStack {} times",
+            hits.load(Ordering::SeqCst)
+        );
+        assert!(statuses.iter().all(|s| !s.is_success()));
+        assert_eq!(statuses.last(), Some(&StatusCode::TOO_MANY_REQUESTS));
+        // Known limit: a customer never seen before is indistinguishable from
+        // an attacker until its credential is checked, so during a flood it
+        // is told to retry. Customers already validated are covered by
+        // `legitimate_customer_still_works_during_a_flood`.
+        assert_eq!(
+            call_with(&state, "tid:good").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn legitimate_customer_still_works_during_a_flood() {
+        let (state, _hits) = counting_state().await;
+        assert_eq!(call_with(&state, "tid:good").await, StatusCode::OK);
+        for i in 0..80 {
+            call_with(&state, &format!("invented-{i}:nope")).await;
+        }
+        assert_eq!(call_with(&state, "tid:good").await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn invented_ids_cannot_fill_counters_before_authentication() {
+        let (state, _hits) = counting_state().await;
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        for i in 0..(MAX_TRACKED_TOKENS + 200) {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer id-{i}:x").parse().unwrap());
+            handle_streamable(State(state.clone()), headers, body.to_string()).await;
+        }
+        assert!(state.streamable_rate_limits.read().await.is_empty());
+        // An unseen valid customer still gets a temporary 429 from the
+        // unknown-credential guard until its 60-second window expires.
+        assert_eq!(
+            call_with(&state, "tid:good").await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
+    #[tokio::test]
+    async fn per_request_limiter_map_stays_bounded_under_invented_ids() {
+        // Invalid tools/list credentials must not allocate token counters.
+        let (state, _hits) = counting_state().await;
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let mut throttled = 0;
+        for i in 0..(MAX_TRACKED_TOKENS + 200) {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer id-{i}:x").parse().unwrap());
+            let status = handle_streamable(State(state.clone()), headers, body.to_string())
+                .await
+                .status();
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                throttled += 1;
+            }
+        }
+        assert!(
+            state.streamable_rate_limits.read().await.is_empty(),
+            "invalid IDs must not allocate counters"
+        );
+        assert!(
+            throttled >= 200,
+            "overflow requests must be refused, got {throttled}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_wrong_credential_is_not_forwarded_twice() {
+        use std::sync::atomic::Ordering;
+        let (state, hits) = counting_state().await;
+        for _ in 0..10 {
+            assert_eq!(
+                call_with(&state, "tid:wrong").await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn tools_call_with_wrong_secret_is_rejected() {
+        assert_eq!(
+            streamable_tools_call("wrong").await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_call_with_valid_secret_is_served() {
+        assert_eq!(streamable_tools_call("good").await, StatusCode::OK);
     }
 
     #[test]

@@ -158,11 +158,26 @@ pub struct SettingsForm {
     pub kb_scopes_json: Option<String>,
 }
 
+fn settings_post_origin_allowed(headers: &HeaderMap, known_urls: &[String]) -> bool {
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    if known_urls.is_empty() {
+        return host.is_some()
+            && origin == Some(crate::oauth::derive_base_url(headers, known_urls).as_str());
+    }
+    known_urls
+        .iter()
+        .any(|url| origin == Some(url.as_str()) && url.split_once("://").map(|(_, h)| h) == host)
+}
+
 pub async fn handle_settings_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     Form(form): Form<SettingsForm>,
 ) -> Response {
+    if !settings_post_origin_allowed(&headers, &state.known_urls) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let (token_id, token_secret) = match resolve_session(&headers, &state.settings_sessions).await {
         Some(creds) => creds,
         None => return Redirect::to("/authorize?response_type=code&client_id=settings-ui&redirect_uri=/settings&code_challenge=&code_challenge_method=&return_to=/settings").into_response(),
@@ -350,6 +365,43 @@ code {{ background: #f3f3f3; padding: 0.1em 0.3em; border-radius: 3px; }}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_post_without_known_urls_requires_same_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "mcp.example.com".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://mcp.example.com".parse().unwrap());
+        assert!(settings_post_origin_allowed(&headers, &[]));
+        headers.insert(header::ORIGIN, "https://evil.example.com".parse().unwrap());
+        assert!(!settings_post_origin_allowed(&headers, &[]));
+        headers.insert(header::ORIGIN, "https://mcp.example.com".parse().unwrap());
+        headers.insert(header::HOST, "other.example.com".parse().unwrap());
+        assert!(!settings_post_origin_allowed(&headers, &[]));
+        headers.remove(header::HOST);
+        assert!(!settings_post_origin_allowed(&headers, &[]));
+    }
+
+    #[test]
+    fn settings_post_rejects_sibling_origin_and_accepts_same_origin() {
+        let urls = vec!["https://mcp.example.com".to_string()];
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "mcp.example.com".parse().unwrap());
+        headers.insert(header::ORIGIN, "https://evil.example.com".parse().unwrap());
+        assert!(!settings_post_origin_allowed(&headers, &urls));
+        headers.insert(header::ORIGIN, "https://mcp.example.com".parse().unwrap());
+        assert!(settings_post_origin_allowed(&headers, &urls));
+        headers.insert(header::HOST, "attacker.example.com".parse().unwrap());
+        assert!(!settings_post_origin_allowed(&headers, &urls));
+        let urls = vec![
+            "https://mcp.example.com".to_string(),
+            "http://mcp.internal:8080".to_string(),
+        ];
+        headers.insert(header::HOST, "mcp.internal:8080".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://mcp.internal:8080".parse().unwrap());
+        assert!(settings_post_origin_allowed(&headers, &urls));
+        headers.remove(header::ORIGIN);
+        assert!(!settings_post_origin_allowed(&headers, &urls));
+    }
 
     /// Issue #122 — the form must still validate clean serde for the
     /// remaining cascade + kb_scopes fields after `indexed_shelves` was

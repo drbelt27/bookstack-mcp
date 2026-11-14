@@ -6,22 +6,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::future::{BoxFuture, FutureExt, Shared};
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
 
 use bsmcp_common::backend::Backend;
 use bsmcp_common::db::{DbBackend, IndexDb, SemanticDb};
-use bsmcp_common::settings::{hash_token_id, CascadeMultipliers, GlobalSettings};
-use bsmcp_common::types::{AclPrefilter, MarkovBlanket, ScopeFilter};
+use bsmcp_common::settings::{CascadeMultipliers, GlobalSettings};
+use bsmcp_common::types::{MarkovBlanket, ScopeFilter};
 
-const PERMISSION_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
-
-/// Default TTL for the durable L2 permission cache (issue #58 lever a).
-/// Override via `BSMCP_PERMISSION_CACHE_TTL_SECS`. 1h is the safety-net
-/// window for missed `permissions_update` webhooks; on-event invalidation
-/// happens through the existing acl_reconcile pipeline.
+/// Retained only to evict stale L2 entries from older deployments; no permission verdict is read from this cache.
 const PERMISSION_CACHE_L2_TTL_SECS_DEFAULT: i64 = 3600;
 
 /// How often the periodic eviction task sweeps the L2 cache.
@@ -123,9 +116,37 @@ pub fn trim_match(mut hit: Value, max_chunks: usize, max_chars: usize) -> Value 
     hit
 }
 
-struct CachedAccess {
-    accessible: bool,
-    cached_at: Instant,
+/// Pick the similarity cut-off: the caller's value wins, then the embedder's
+/// model-specific default, then the original fixed defaults (calibrated for
+/// the bge models).
+fn resolve_threshold(explicit: Option<f32>, model_default: Option<f32>, hybrid: bool) -> f32 {
+    explicit
+        .or(model_default)
+        .unwrap_or(if hybrid { 0.45 } else { 0.50 })
+}
+
+fn parse_embed_response(body: &Value) -> Result<(Vec<f32>, Option<f32>), String> {
+    let embedding = body
+        .get("embeddings")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_array())
+        .ok_or("Invalid embedder response format")?;
+
+    let vec: Vec<f32> = embedding
+        .iter()
+        .filter_map(|v| v.as_f64().map(|f| f as f32))
+        .collect();
+
+    if vec.is_empty() {
+        return Err("Empty embedding returned".to_string());
+    }
+
+    let default_threshold = body
+        .get("default_threshold")
+        .and_then(|v| v.as_f64())
+        .map(|f| f as f32);
+    Ok((vec, default_threshold))
 }
 
 /// Wall-clock seconds since epoch. Used as the `cached_at` value for the L2
@@ -190,36 +211,7 @@ pub struct SemanticState {
     embedder_url: String,
     webhook_secret: String,
     http_client: reqwest::Client,
-    /// L1 in-memory permission cache: `(token_hash, page_id) -> CachedAccess`.
-    /// Issue #58 lever a: rekeyed from raw `token_id` to `SHA256(token_id)` so
-    /// the in-memory shape matches the L2 (`permission_cache` table) key. The
-    /// raw `token_id` is held only by the live `BookStackClient`; it never
-    /// lands in our cache map.
-    permission_cache: RwLock<HashMap<(String, i64), CachedAccess>>,
-    /// Per-token cached role-id list (issue #58 lever a.5). The DB prefilter
-    /// needs the calling user's role IDs; resolving them is two HTTP calls
-    /// to BookStack. 5 minute TTL because roles change rarely.
-    role_id_cache: RwLock<HashMap<String, CachedRoleIds>>,
-    /// Page IDs currently being reconciled by a background ACL recompute
-    /// (issue #58 lever b). Reads + writes under a `RwLock` so concurrent
-    /// `filter_by_permission` calls don't double-fire a recompute on the
-    /// same page. The set self-cleans as each spawned task finishes.
-    acl_recompute_inflight: RwLock<HashSet<i64>>,
-    /// Cached `RoleContext` (all_role_ids + view_all_role_ids) so background
-    /// recompute doesn't reissue the `list_roles` + per-role detail fetch on
-    /// every search. 5 min TTL — roles change rarely.
-    role_ctx_cache: RwLock<Option<CachedRoleContext>>,
-    /// In-flight HTTP-check coalescing map (issue #58 lever c). Keyed by
-    /// `(token_hash, page_id)`; concurrent searches asking about the same
-    /// page reuse the running future via `futures::future::Shared` instead
-    /// of issuing a duplicate `can_access_page` call.
-    acl_http_inflight: InflightCheckMap,
 }
-
-/// Cap on the in-flight set per [`SemanticState`]. When a single search
-/// produces more uncomputed pages than this, the spawner queues a global
-/// `acl_reconcile` job and bails instead of fanning out per-page tasks.
-const ACL_RECOMPUTE_INFLIGHT_CAP: usize = 200;
 
 /// Default concurrency for the HTTP fan-out fallback (issue #58 lever c).
 /// Override with `BSMCP_ACL_HTTP_CONCURRENCY`. Matches the pre-#58 value;
@@ -249,36 +241,6 @@ fn acl_http_timeout() -> Duration {
         .unwrap_or(ACL_HTTP_TIMEOUT_DEFAULT)
 }
 
-/// In-flight HTTP-check map for request coalescing (issue #58 lever c).
-/// When two concurrent searches reach the HTTP fallback for the same
-/// `(token_hash, page_id)`, the second one joins the first's future
-/// instead of issuing a duplicate `can_access_page` call.
-///
-/// The value is a [`Shared`] future producing the access decision. The
-/// underlying work runs once via `tokio::spawn`; multiple awaiters get
-/// clones of the shared handle. The spawner cleans up its own slot on
-/// completion via the cleanup closure inside [`coalesced_can_access_page`].
-type InflightCheckMap =
-    tokio::sync::Mutex<HashMap<(String, i64), Shared<BoxFuture<'static, bool>>>>;
-/// Max concurrent `reconcile_page` HTTP calls per kick. Each call is ~3
-/// `get_content_permissions` requests; 5 keeps the background load below
-/// foreground search budget.
-const ACL_RECOMPUTE_HTTP_CONCURRENCY: usize = 5;
-
-struct CachedRoleContext {
-    ctx: bsmcp_common::acl::RoleContext,
-    cached_at: Instant,
-}
-
-/// Per-token cached role-id list with a TTL. Held inside
-/// [`SemanticState::role_id_cache`].
-struct CachedRoleIds {
-    role_ids: Vec<i64>,
-    cached_at: Instant,
-}
-
-const ROLE_ID_CACHE_TTL: Duration = Duration::from_secs(300);
-
 impl SemanticState {
     pub fn new(
         db: Arc<dyn SemanticDb>,
@@ -299,277 +261,6 @@ impl SemanticState {
             embedder_url: embedder_url.trim_end_matches('/').to_string(),
             webhook_secret,
             http_client,
-            permission_cache: RwLock::new(HashMap::new()),
-            role_id_cache: RwLock::new(HashMap::new()),
-            acl_recompute_inflight: RwLock::new(HashSet::new()),
-            role_ctx_cache: RwLock::new(None),
-            acl_http_inflight: tokio::sync::Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Coalesced + timeout-capped HTTP page-access check (issue #58 lever c).
-    ///
-    /// If another concurrent caller is already running `can_access_page`
-    /// for `(token_hash, page_id)`, joins that running future via
-    /// [`Shared`] instead of firing a duplicate request. The first caller
-    /// inserts a fresh shared future, runs it, removes the slot when done,
-    /// and returns the result.
-    ///
-    /// Wrapped in `tokio::time::timeout` with the per-page timeout from
-    /// [`acl_http_timeout`]. A timeout is treated as a deny — same as the
-    /// pre-#58 behavior when BookStack returned a non-success response —
-    /// plus a structured warning log so the bake numbers stay observable.
-    pub(crate) async fn coalesced_can_access_page(
-        self: &Arc<Self>,
-        token_hash: &str,
-        page_id: i64,
-        client: Arc<dyn Backend>,
-    ) -> bool {
-        let key = (token_hash.to_string(), page_id);
-        let (fut, is_owner) = {
-            let mut map = self.acl_http_inflight.lock().await;
-            if let Some(existing) = map.get(&key) {
-                (existing.clone(), false)
-            } else {
-                let timeout = acl_http_timeout();
-                let client_for_fut = client;
-                let work = async move {
-                    match tokio::time::timeout(timeout, client_for_fut.can_access_page(page_id))
-                        .await
-                    {
-                        Ok(ok) => ok,
-                        Err(_) => {
-                            tracing::warn!(
-                                target: "acl_filter",
-                                page_id,
-                                timeout_ms = timeout.as_millis() as u64,
-                                "acl_http_check_timeout"
-                            );
-                            false
-                        }
-                    }
-                };
-                let fut: Shared<BoxFuture<'static, bool>> = work.boxed().shared();
-                map.insert(key.clone(), fut.clone());
-                (fut, true)
-            }
-        };
-
-        let result = fut.await;
-
-        if is_owner {
-            // Best-effort cleanup. If a concurrent caller saw the same slot
-            // and entered the joiner branch, they cloned the shared future
-            // before we removed it — both paths still return the same value.
-            let mut map = self.acl_http_inflight.lock().await;
-            map.remove(&key);
-        }
-
-        result
-    }
-
-    /// Fire-and-forget background recompute for pages the prefilter
-    /// flagged `Uncomputed` (issue #58 lever b). Existing webhook handler
-    /// already queues an `acl_reconcile` job on `role_*` /
-    /// `permissions_update` — that path is unchanged. This is the
-    /// complementary on-demand path: when a search's first miss surfaces
-    /// brand-new pages whose ACLs the embedder hasn't computed yet, kick
-    /// a per-page reconcile in the background so the next search hits
-    /// the prefilter instead of HTTP.
-    ///
-    /// Concurrency is in-flight-gated per [`SemanticState`] so concurrent
-    /// searches don't double-fire on the same page id. When the in-flight
-    /// set exceeds [`ACL_RECOMPUTE_INFLIGHT_CAP`], the spawner queues a
-    /// global `acl_reconcile` job and bails out — the daily cron pipeline
-    /// catches up cheaper than 200+ parallel HTTP fan-outs.
-    ///
-    /// Concurrency cap per kick: [`ACL_RECOMPUTE_HTTP_CONCURRENCY`].
-    pub(crate) async fn kick_background_acl_recompute(
-        self: &Arc<Self>,
-        client: &Arc<dyn Backend>,
-        uncomputed_page_ids: Vec<i64>,
-    ) {
-        if uncomputed_page_ids.is_empty() {
-            return;
-        }
-        // Drop ids that are already in flight from another search; reserve the
-        // rest atomically so a concurrent caller sees them as in-flight too.
-        let mut to_kick: Vec<i64> = Vec::with_capacity(uncomputed_page_ids.len());
-        {
-            let mut inflight = self.acl_recompute_inflight.write().await;
-            // Backpressure: too many parallel recomputes in flight already —
-            // hand off to the global `acl_reconcile` pipeline.
-            if inflight.len() >= ACL_RECOMPUTE_INFLIGHT_CAP {
-                drop(inflight);
-                if let Err(e) = self.db.create_embed_job("acl_reconcile").await {
-                    tracing::warn!(
-                        target: "acl_filter",
-                        error = %e,
-                        "acl_recompute_backpressure_queue_failed"
-                    );
-                } else {
-                    tracing::info!(
-                        target: "acl_filter",
-                        pending = uncomputed_page_ids.len(),
-                        "acl_recompute_backpressure_queued_global"
-                    );
-                }
-                return;
-            }
-            for pid in uncomputed_page_ids {
-                if inflight.insert(pid) {
-                    to_kick.push(pid);
-                }
-                if inflight.len() >= ACL_RECOMPUTE_INFLIGHT_CAP {
-                    // Reserved up to the cap; rest get punted to the daily
-                    // pipeline through the global queue.
-                    break;
-                }
-            }
-        }
-        if to_kick.is_empty() {
-            return;
-        }
-
-        let me = self.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            // Build/refresh the role context once per kick. Cached so a
-            // burst of searches doesn't re-issue the `list_roles` + per-role
-            // detail fetches.
-            let role_ctx = match me.role_context(&client).await {
-                Some(ctx) => ctx,
-                None => {
-                    // Couldn't build role context — release the in-flight
-                    // reservations so a future call can retry.
-                    let mut inflight = me.acl_recompute_inflight.write().await;
-                    for pid in &to_kick {
-                        inflight.remove(pid);
-                    }
-                    return;
-                }
-            };
-
-            let kicked = to_kick.len();
-            let started = Instant::now();
-            let me_for_stream = me.clone();
-            let client_for_stream = client.clone();
-            let role_ctx_for_stream = role_ctx.clone();
-            stream::iter(to_kick.clone())
-                .for_each_concurrent(ACL_RECOMPUTE_HTTP_CONCURRENCY, move |pid| {
-                    let me = me_for_stream.clone();
-                    let client = client_for_stream.clone();
-                    let role_ctx = role_ctx_for_stream.clone();
-                    async move {
-                        if let Err(e) = bsmcp_common::acl::reconcile_page(
-                            client.as_ref(),
-                            &me.db,
-                            pid,
-                            &role_ctx,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                target: "acl_filter",
-                                page_id = pid,
-                                error = %e,
-                                "acl_recompute_failed"
-                            );
-                        }
-                    }
-                })
-                .await;
-
-            // Release in-flight reservations.
-            {
-                let mut inflight = me.acl_recompute_inflight.write().await;
-                for pid in &to_kick {
-                    inflight.remove(pid);
-                }
-            }
-
-            tracing::info!(
-                target: "acl_filter",
-                pages = kicked,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "acl_recompute_done"
-            );
-        });
-    }
-
-    /// Build or fetch the cached `RoleContext`. Stored on `SemanticState`
-    /// rather than per-token because role-level system perms are global —
-    /// the context doesn't change between callers.
-    async fn role_context(
-        &self,
-        client: &Arc<dyn Backend>,
-    ) -> Option<bsmcp_common::acl::RoleContext> {
-        {
-            let read = self.role_ctx_cache.read().await;
-            if let Some(cached) = read.as_ref() {
-                if cached.cached_at.elapsed() < ROLE_ID_CACHE_TTL {
-                    return Some(cached.ctx.clone());
-                }
-            }
-        }
-        match bsmcp_common::acl::build_role_context(client.as_ref()).await {
-            Ok(ctx) => {
-                let mut write = self.role_ctx_cache.write().await;
-                *write = Some(CachedRoleContext {
-                    ctx: ctx.clone(),
-                    cached_at: Instant::now(),
-                });
-                Some(ctx)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "acl_filter",
-                    error = %e,
-                    "acl_role_context_build_failed"
-                );
-                None
-            }
-        }
-    }
-
-    /// Resolve the calling user's role IDs, caching per `token_hash` with
-    /// [`ROLE_ID_CACHE_TTL`]. Returns `None` when `list_my_roles` declines
-    /// to identify the user (brand-new account with no content), in which
-    /// case the prefilter is bypassed — every page falls through to HTTP.
-    async fn resolve_caller_role_ids(
-        &self,
-        client: &Arc<dyn Backend>,
-        token_hash: &str,
-    ) -> Option<Vec<i64>> {
-        {
-            let read = self.role_id_cache.read().await;
-            if let Some(entry) = read.get(token_hash) {
-                if entry.cached_at.elapsed() < ROLE_ID_CACHE_TTL {
-                    return Some(entry.role_ids.clone());
-                }
-            }
-        }
-        match client.list_my_roles().await {
-            Ok(Some(role_ids)) => {
-                let mut write = self.role_id_cache.write().await;
-                write.insert(
-                    token_hash.to_string(),
-                    CachedRoleIds {
-                        role_ids: role_ids.clone(),
-                        cached_at: Instant::now(),
-                    },
-                );
-                Some(role_ids)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(
-                    target: "acl_filter",
-                    error = %e,
-                    "list_my_roles_failed"
-                );
-                None
-            }
         }
     }
 
@@ -706,9 +397,11 @@ impl SemanticState {
         });
     }
 
-    /// Embed a query by calling the external embedder service.
-    /// Retries once on transient failures (connection errors, timeouts, 5xx).
-    async fn embed_query(&self, query: &str) -> Result<Vec<f32>, String> {
+    /// Embed a query by calling the external embedder service. Returns the
+    /// vector plus the embedder's recommended similarity threshold, if its
+    /// model has one. Retries once on transient failures (connection errors,
+    /// timeouts, 5xx).
+    async fn embed_query(&self, query: &str) -> Result<(Vec<f32>, Option<f32>), String> {
         let url = format!("{}/embed", self.embedder_url);
         let mut last_err = String::new();
 
@@ -750,296 +443,116 @@ impl SemanticState {
                 .await
                 .map_err(|e| format!("Embedder response parse error: {e}"))?;
 
-            let embedding = body
-                .get("embeddings")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_array())
-                .ok_or("Invalid embedder response format")?;
-
-            let vec: Vec<f32> = embedding
-                .iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32))
-                .collect();
-
-            if vec.is_empty() {
-                return Err("Empty embedding returned".to_string());
-            }
-
-            return Ok(vec);
+            return parse_embed_response(&body);
         }
 
         Err(last_err)
     }
 
-    /// Filter search results by the user's BookStack API permissions.
-    /// Checks each page individually via GET /api/pages/{id} — returns 200 for
-    /// accessible pages, 403/404 for restricted. This correctly handles custom
-    /// entity permissions (unlike filter[id:in] on the list endpoint).
-    ///
-    /// Four-tier filter (issue #58 levers a + a.5):
-    ///   1. L1 — in-memory `HashMap<(token_hash, page_id), CachedAccess>`,
-    ///      5 minute TTL. Same as before; rekeyed to `token_hash`.
-    ///   2. L2 — durable `permission_cache` table, default 1h TTL
-    ///      (`BSMCP_PERMISSION_CACHE_TTL_SECS`). Survives restart.
-    ///   3. DB-side prefilter — joins `pages` against `page_view_acl` to
-    ///      drop denied pages and admit role-matched pages without HTTP.
-    ///      Big win on cold caches with heterogeneous role-restricted books.
-    ///   4. HTTP fallback — `can_access_page` per remaining page (uncomputed
-    ///      pages + default-open pages that still need the system-perm
-    ///      check). Uncomputed pages also trigger a background recompute.
-    ///
-    /// Per-call structured counters (issue #58 lever 0): cache_hits,
-    /// cache_misses, http_fallback fan-out and wall-clock. Emitted as a
-    /// single `tracing::info!(target: "acl_filter", ...)` event at end of
-    /// call. Field names are Prometheus-counter-shaped so #90 Phase 2 can
-    /// promote them without rename:
-    ///   bsmcp_acl_cache_hits_total       (L1 + L2 combined)
-    ///   bsmcp_acl_cache_misses_total
-    ///   bsmcp_acl_http_fallback_total
-    ///   bsmcp_acl_http_fallback_duration_seconds
+    /// Drop blanket neighbors the caller cannot view. `known` holds verdicts
+    /// already obtained from the candidate check, so only neighbors without
+    /// one cost a BookStack request.
+    async fn filter_blankets(
+        self: &Arc<Self>,
+        blankets: &mut HashMap<i64, MarkovBlanket>,
+        client: &Arc<dyn Backend>,
+        known: &HashMap<i64, bool>,
+    ) {
+        let unknown: Vec<i64> = blankets
+            .values()
+            .flat_map(|b| {
+                b.linked_from
+                    .iter()
+                    .chain(b.links_to.iter())
+                    .chain(b.co_linked.iter())
+                    .chain(b.siblings.iter())
+            })
+            .map(|p| p.page_id)
+            .filter(|id| !known.contains_key(id))
+            .collect();
+        let mut accessible: HashSet<i64> = known
+            .iter()
+            .filter_map(|(id, ok)| ok.then_some(*id))
+            .collect();
+        accessible.extend(
+            self.check_pages(&unknown, client, acl_http_timeout())
+                .await
+                .0,
+        );
+        for blanket in blankets.values_mut() {
+            blanket
+                .linked_from
+                .retain(|p| accessible.contains(&p.page_id));
+            blanket.links_to.retain(|p| accessible.contains(&p.page_id));
+            blanket
+                .co_linked
+                .retain(|p| accessible.contains(&p.page_id));
+            blanket.siblings.retain(|p| accessible.contains(&p.page_id));
+        }
+    }
+
+    /// Check every page against BookStack with the caller's credentials; cached ACLs are not authoritative.
+    /// A check that does not answer within `timeout` is denied (fail closed) and counted, so the
+    /// caller can tell an incomplete answer from a genuinely empty one.
+    async fn check_pages(
+        self: &Arc<Self>,
+        page_ids: &[i64],
+        client: &Arc<dyn Backend>,
+        timeout: Duration,
+    ) -> (Vec<i64>, usize) {
+        let started = Instant::now();
+        let unique: HashSet<i64> = page_ids.iter().copied().collect();
+        let http_checks = unique.len();
+        let client = client.clone();
+        let verdicts: Vec<(i64, Option<bool>)> = stream::iter(unique)
+            .map(|pid| {
+                let client = client.clone();
+                async move {
+                    (
+                        pid,
+                        tokio::time::timeout(timeout, client.can_access_page(pid))
+                            .await
+                            .ok(),
+                    )
+                }
+            })
+            .buffer_unordered(acl_http_concurrency())
+            .collect()
+            .await;
+        let unverified = verdicts.iter().filter(|(_, v)| v.is_none()).count();
+        let accessible: Vec<i64> = verdicts
+            .into_iter()
+            .filter_map(|(pid, v)| (v == Some(true)).then_some(pid))
+            .collect();
+        if unverified > 0 {
+            tracing::warn!(
+                target: "acl_filter",
+                unverified,
+                timeout_ms = timeout.as_millis() as u64,
+                "acl_checks_timed_out_denied"
+            );
+        }
+        tracing::info!(
+            target: "acl_filter",
+            candidates = page_ids.len(),
+            http_checks = http_checks,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            accessible = accessible.len(),
+            unverified,
+            "acl_filter_done"
+        );
+        (accessible, unverified)
+    }
+
+    #[cfg(test)]
     async fn filter_by_permission(
         self: &Arc<Self>,
         page_ids: &[i64],
         client: &Arc<dyn Backend>,
     ) -> Vec<i64> {
-        let token_hash = hash_token_id(client.token_id());
-        let now = Instant::now();
-        let call_start = Instant::now();
-
-        let mut uncached_ids: Vec<i64> = Vec::new();
-        let mut accessible: Vec<i64> = Vec::new();
-        let mut l1_hits: usize = 0;
-
-        {
-            let cache = self.permission_cache.read().await;
-            for &pid in page_ids {
-                let key = (token_hash.clone(), pid);
-                if let Some(entry) = cache.get(&key) {
-                    if now.duration_since(entry.cached_at) < PERMISSION_CACHE_TTL {
-                        l1_hits += 1;
-                        if entry.accessible {
-                            accessible.push(pid);
-                        }
-                        continue;
-                    }
-                }
-                uncached_ids.push(pid);
-            }
-        }
-
-        // L2: durable cache for anything L1 didn't have. Best-effort: if the
-        // backend errors out we just treat as a miss and HTTP-fall-through.
-        let mut l2_hits: usize = 0;
-        if !uncached_ids.is_empty() {
-            let ttl = permission_cache_l2_ttl_secs();
-            let min_cached_at = now_unix_secs() - ttl;
-            match self
-                .db
-                .get_permission_cache_batch(&token_hash, &uncached_ids, min_cached_at)
-                .await
-            {
-                Ok(rows) => {
-                    let hit_map: HashMap<i64, bool> = rows.into_iter().collect();
-                    let mut still_uncached: Vec<i64> = Vec::with_capacity(uncached_ids.len());
-                    // Hydrate L1 with L2 hits, settle accessibility immediately.
-                    let mut l1_writer = self.permission_cache.write().await;
-                    for pid in uncached_ids.drain(..) {
-                        if let Some(&viewable) = hit_map.get(&pid) {
-                            l2_hits += 1;
-                            l1_writer.insert(
-                                (token_hash.clone(), pid),
-                                CachedAccess {
-                                    accessible: viewable,
-                                    cached_at: now,
-                                },
-                            );
-                            if viewable {
-                                accessible.push(pid);
-                            }
-                        } else {
-                            still_uncached.push(pid);
-                        }
-                    }
-                    uncached_ids = still_uncached;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "acl_filter",
-                        error = %e,
-                        "permission_cache_l2_lookup_failed"
-                    );
-                }
-            }
-        }
-
-        // DB-side ACL prefilter (issue #58 lever a.5). Cuts the pool before
-        // HTTP fan-out. Each remaining candidate gets bucketed into
-        // {Allow, Deny, DefaultOpen, Uncomputed}; Allow → accessible, Deny
-        // → dropped, DefaultOpen + Uncomputed → HTTP fallback.
-        let mut prefilter_allow: usize = 0;
-        let mut prefilter_deny: usize = 0;
-        let mut prefilter_default_open: usize = 0;
-        let mut prefilter_uncomputed: usize = 0;
-        let mut recompute_candidates: Vec<i64> = Vec::new();
-        if !uncached_ids.is_empty() {
-            if let Some(role_ids) = self.resolve_caller_role_ids(client, &token_hash).await {
-                match self
-                    .db
-                    .prefilter_pages_by_roles(&uncached_ids, &role_ids)
-                    .await
-                {
-                    Ok(verdicts) => {
-                        let verdict_map: HashMap<i64, AclPrefilter> =
-                            verdicts.into_iter().collect();
-                        let mut still_pending: Vec<i64> = Vec::with_capacity(uncached_ids.len());
-                        // Note: pages missing from `pages` (not embedded) have
-                        // no verdict at all; default to Uncomputed (HTTP).
-                        for pid in uncached_ids.drain(..) {
-                            match verdict_map.get(&pid).copied() {
-                                Some(AclPrefilter::Allow) => {
-                                    prefilter_allow += 1;
-                                    accessible.push(pid);
-                                }
-                                Some(AclPrefilter::Deny) => {
-                                    prefilter_deny += 1;
-                                    // Dropped silently. No HTTP, no result.
-                                }
-                                Some(AclPrefilter::DefaultOpen) => {
-                                    prefilter_default_open += 1;
-                                    still_pending.push(pid);
-                                }
-                                Some(AclPrefilter::Uncomputed) => {
-                                    prefilter_uncomputed += 1;
-                                    still_pending.push(pid);
-                                    recompute_candidates.push(pid);
-                                }
-                                None => {
-                                    // Page missing from the embedding store
-                                    // entirely. No ACL signal exists yet, but
-                                    // there's no `pages` row to recompute
-                                    // against either — pure HTTP fallback.
-                                    prefilter_uncomputed += 1;
-                                    still_pending.push(pid);
-                                }
-                            }
-                        }
-                        uncached_ids = still_pending;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "acl_filter",
-                            error = %e,
-                            "acl_prefilter_failed"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Lever b: fire-and-forget background recompute for Uncomputed pages.
-        // The webhook handler already queues `acl_reconcile` on role and
-        // permission events; this is the complementary on-demand path so the
-        // first search after a new-page embed primes the prefilter for the
-        // next call instead of paying repeated HTTP fan-out.
-        if !recompute_candidates.is_empty() {
-            self.kick_background_acl_recompute(client, recompute_candidates)
-                .await;
-        }
-
-        let cache_misses = uncached_ids.len();
-        let mut http_fallback_fired: usize = 0;
-        let mut http_fallback_ms: u128 = 0;
-
-        if !uncached_ids.is_empty() {
-            // Coalesced + bounded HTTP fan-out (issue #58 lever c).
-            // `buffer_unordered` replaces the pre-#58 manual spawn + JoinHandle
-            // vec + Semaphore; same effect, env-tunable, cleaner shutdown.
-            // `coalesced_can_access_page` shares an in-flight future across
-            // concurrent searches asking about the same page id, and wraps the
-            // call in a 5s timeout so one slow page can't hold the whole pool.
-            let http_start = Instant::now();
-            let concurrency = acl_http_concurrency();
-            let me = self.clone();
-            let token_hash_clone = token_hash.clone();
-            let client = client.clone();
-            let results: Vec<(i64, bool)> = stream::iter(uncached_ids.clone())
-                .map(|pid| {
-                    let me = me.clone();
-                    let token_hash = token_hash_clone.clone();
-                    let client = client.clone();
-                    async move {
-                        let ok = me.coalesced_can_access_page(&token_hash, pid, client).await;
-                        (pid, ok)
-                    }
-                })
-                .buffer_unordered(concurrency)
-                .collect()
-                .await;
-            http_fallback_fired = results.len();
-            http_fallback_ms = http_start.elapsed().as_millis();
-
-            {
-                let mut cache = self.permission_cache.write().await;
-                for &(pid, ok) in &results {
-                    cache.insert(
-                        (token_hash.clone(), pid),
-                        CachedAccess {
-                            accessible: ok,
-                            cached_at: now,
-                        },
-                    );
-                    if ok {
-                        accessible.push(pid);
-                    }
-                }
-                // Evict stale entries if cache grows large
-                if cache.len() > 10_000 {
-                    cache.retain(|_, entry| {
-                        now.duration_since(entry.cached_at) < PERMISSION_CACHE_TTL
-                    });
-                }
-            }
-
-            // L2 write-through. Best-effort: a failure here doesn't sink the
-            // foreground call — next request will just refetch.
-            let now_secs = now_unix_secs();
-            if let Err(e) = self
-                .db
-                .upsert_permission_cache_batch(&token_hash, &results, now_secs)
-                .await
-            {
-                tracing::warn!(
-                    target: "acl_filter",
-                    error = %e,
-                    "permission_cache_l2_upsert_failed"
-                );
-            }
-        }
-
-        // Per-call ACL filter telemetry. One structured event per
-        // `filter_by_permission` invocation; #90 Phase 2 promotes to
-        // counters without renaming the fields.
-        let cache_hits = l1_hits + l2_hits;
-        tracing::info!(
-            target: "acl_filter",
-            candidates = page_ids.len(),
-            cache_hits = cache_hits,
-            cache_misses = cache_misses,
-            l1_hits = l1_hits,
-            l2_hits = l2_hits,
-            prefilter_allow = prefilter_allow,
-            prefilter_deny = prefilter_deny,
-            prefilter_default_open = prefilter_default_open,
-            prefilter_uncomputed = prefilter_uncomputed,
-            http_fallback = http_fallback_fired,
-            http_fallback_ms = http_fallback_ms as u64,
-            elapsed_ms = call_start.elapsed().as_millis() as u64,
-            accessible = accessible.len(),
-            "acl_filter_done"
-        );
-
-        accessible
+        self.check_pages(page_ids, client, acl_http_timeout())
+            .await
+            .0
     }
 
     /// Hybrid search: vector + keyword + blanket re-ranking, with an
@@ -1062,7 +575,7 @@ impl SemanticState {
         self: &Arc<Self>,
         query: &str,
         limit: usize,
-        threshold: f32,
+        threshold: Option<f32>,
         hybrid: bool,
         verbose: bool,
         client: &Arc<dyn Backend>,
@@ -1084,6 +597,7 @@ impl SemanticState {
                     query,
                     limit,
                     threshold,
+                    hybrid,
                     verbose,
                     client,
                     resolved_scope.as_ref(),
@@ -1102,7 +616,8 @@ impl SemanticState {
         let candidate_multiplier: usize = 2;
         let scope_for_vector = resolved_scope.clone();
         let vector_future = async {
-            let query_vec = self.embed_query(query).await?;
+            let (query_vec, model_default) = self.embed_query(query).await?;
+            let threshold = resolve_threshold(threshold, model_default, hybrid);
             self.db
                 .vector_search(
                     &query_vec,
@@ -1213,8 +728,14 @@ impl SemanticState {
 
         // Permission check: filter out pages the user can't access
         let all_page_ids: Vec<i64> = page_scores.keys().copied().collect();
-        let accessible_ids = self.filter_by_permission(&all_page_ids, client).await;
+        let (accessible_ids, acl_unverified) = self
+            .check_pages(&all_page_ids, client, acl_http_timeout())
+            .await;
         let accessible_set: HashSet<i64> = accessible_ids.iter().copied().collect();
+        let verdicts: HashMap<i64, bool> = all_page_ids
+            .iter()
+            .map(|pid| (*pid, accessible_set.contains(pid)))
+            .collect();
         page_scores.retain(|pid, _| accessible_set.contains(pid));
 
         // Issue #80: precision mode now dispatches to `precision_cascade()`
@@ -1249,7 +770,9 @@ impl SemanticState {
                 .collect()
                 .await;
 
-        let blanket_cache: HashMap<i64, MarkovBlanket> = blanket_fetches.into_iter().collect();
+        // Neighbors only influence the score when they are themselves verified
+        // results (`scored_set`); the blanket is verified again before display.
+        let mut blanket_cache: HashMap<i64, MarkovBlanket> = blanket_fetches.into_iter().collect();
 
         for (&page_id, blanket) in blanket_cache.iter() {
             let mut strong = 0usize;
@@ -1264,7 +787,7 @@ impl SemanticState {
                 let nid = related.page_id;
                 if scored_set.contains(&nid) {
                     strong += 1;
-                } else if all_hit_page_ids.contains(&nid) {
+                } else if all_hit_page_ids.contains(&nid) && accessible_set.contains(&nid) {
                     weak += 1;
                 }
             }
@@ -1423,7 +946,6 @@ impl SemanticState {
 
         // For verbose mode, fetch any blankets we haven't already cached during
         // re-ranking. Most final results will hit the cache for free.
-        let mut blanket_cache = blanket_cache;
         if verbose {
             let missing: Vec<i64> = final_page_ids
                 .iter()
@@ -1439,10 +961,14 @@ impl SemanticState {
                     .filter_map(|x| async move { x })
                     .collect()
                     .await;
-                for (pid, b) in extras {
-                    blanket_cache.insert(pid, b);
-                }
+                blanket_cache.extend(extras);
             }
+            let mut shown: HashMap<i64, MarkovBlanket> = final_page_ids
+                .iter()
+                .filter_map(|pid| blanket_cache.get(pid).map(|b| (*pid, b.clone())))
+                .collect();
+            self.filter_blankets(&mut shown, client, &verdicts).await;
+            blanket_cache = shown;
         }
 
         // Build result JSON
@@ -1517,6 +1043,7 @@ impl SemanticState {
         let mut stats_json = json!({
             "total_indexed": stats.total_pages,
             "total_chunks": stats.total_chunks,
+            "acl_unverified": acl_unverified,
             "query_time_ms": query_time_ms,
             "mode": mode.as_str(),
             "hybrid": hybrid,
@@ -1795,7 +1322,8 @@ impl SemanticState {
         self: &Arc<Self>,
         query: &str,
         limit: usize,
-        threshold: f32,
+        threshold: Option<f32>,
+        hybrid: bool,
         verbose: bool,
         client: &Arc<dyn Backend>,
         scope: Option<&ScopeFilter>,
@@ -1811,7 +1339,8 @@ impl SemanticState {
         // SQL-side intersection is cheaper than post-filtering when scope
         // cardinality is small (which is the common case for named scopes
         // like `policies` or a single shelf).
-        let query_vec = self.embed_query(query).await?;
+        let (query_vec, model_default) = self.embed_query(query).await?;
+        let threshold = resolve_threshold(threshold, model_default, hybrid);
         let hits = self
             .db
             .vector_search(&query_vec, pool_stage1, threshold, scope)
@@ -1884,8 +1413,14 @@ impl SemanticState {
         // here (4 small indexed queries per page); concurrency 20 is the
         // sweet spot for both SQLite and Postgres backends.
         let page_ids: Vec<i64> = page_scores.keys().copied().collect();
-        let accessible_ids = self.filter_by_permission(&page_ids, client).await;
+        let (accessible_ids, acl_unverified) = self
+            .check_pages(&page_ids, client, acl_http_timeout())
+            .await;
         let accessible_set: HashSet<i64> = accessible_ids.iter().copied().collect();
+        let verdicts: HashMap<i64, bool> = page_ids
+            .iter()
+            .map(|pid| (*pid, accessible_set.contains(pid)))
+            .collect();
         page_scores.retain(|pid, _| accessible_set.contains(pid));
 
         let scored_set: HashSet<i64> = page_scores.keys().copied().collect();
@@ -1898,7 +1433,9 @@ impl SemanticState {
             .filter_map(|x| async move { x })
             .collect()
             .await;
-        let blanket_cache: HashMap<i64, MarkovBlanket> = blanket_fetches.into_iter().collect();
+        // Same rule as the standard path: only verified results can boost a
+        // page, and the blanket is re-verified before it is shown.
+        let mut blanket_cache: HashMap<i64, MarkovBlanket> = blanket_fetches.into_iter().collect();
 
         for (page_id, blanket) in blanket_cache.iter() {
             let mut strong = 0usize;
@@ -1913,7 +1450,7 @@ impl SemanticState {
                 let nid = related.page_id;
                 if scored_set.contains(&nid) {
                     strong += 1;
-                } else if all_hit_page_ids.contains(&nid) {
+                } else if all_hit_page_ids.contains(&nid) && accessible_set.contains(&nid) {
                     weak += 1;
                 }
             }
@@ -1961,6 +1498,7 @@ impl SemanticState {
                 "stats": {
                     "total_indexed": stats.total_pages,
                     "total_chunks": stats.total_chunks,
+                    "acl_unverified": acl_unverified,
                     "query_time_ms": start.elapsed().as_millis(),
                     "mode": SearchMode::Precision.as_str(),
                     "hybrid": false,
@@ -2039,6 +1577,15 @@ impl SemanticState {
                 .push(detail);
         }
 
+        if verbose {
+            let mut shown: HashMap<i64, MarkovBlanket> = ranked
+                .iter()
+                .filter_map(|(pid, _)| blanket_cache.get(pid).map(|b| (*pid, b.clone())))
+                .collect();
+            self.filter_blankets(&mut shown, client, &verdicts).await;
+            blanket_cache = shown;
+        }
+
         let mut results = Vec::with_capacity(ranked.len());
         for (page_id, rerank_score) in &ranked {
             let (page_name, book_id, updated_at) = match meta_by_page.get(page_id) {
@@ -2110,6 +1657,7 @@ impl SemanticState {
         let mut stats_json = json!({
             "total_indexed": stats.total_pages,
             "total_chunks": stats.total_chunks,
+            "acl_unverified": acl_unverified,
             "query_time_ms": query_time_ms,
             "rerank_ms": rerank_ms,
             "mode": SearchMode::Precision.as_str(),
@@ -2863,6 +2411,7 @@ mod acl_fanout_tests {
 
     use super::*;
     use bsmcp_common::bookstack::BookStackClient;
+    use bsmcp_common::settings::hash_token_id;
     use bsmcp_db_sqlite::SqliteDb;
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -2998,15 +2547,7 @@ mod acl_fanout_tests {
 
     pub(crate) fn temp_sqlite_path(label: &str) -> PathBuf {
         let dir = std::env::temp_dir();
-        let unique = format!(
-            "bsmcp-acl58-{label}-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        dir.join(unique)
+        dir.join(format!("bsmcp-acl58-{label}-{}.db", uuid::Uuid::new_v4()))
     }
 
     pub(crate) async fn make_state(label: &str, embedder_url: String) -> Arc<SemanticState> {
@@ -3028,12 +2569,174 @@ mod acl_fanout_tests {
         ))
     }
 
-    /// Lever 0 — counters. Verifies that a second call hits the in-memory
-    /// cache (no extra `can_access_page` requests fire). Also exercises the
-    /// happy path of `filter_by_permission` end-to-end against a sqlite
-    /// backend + mock BookStack.
     #[tokio::test]
-    async fn filter_by_permission_caches_hits() {
+    async fn blanket_never_exposes_or_scores_inaccessible_neighbor() {
+        use bsmcp_common::types::RelatedPage;
+        let (base, _) = mock_bookstack(vec![1]).await;
+        let state = make_state("blanket-denied", "http://unused".to_string()).await;
+        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "tid",
+            "tsecret",
+            reqwest::Client::new(),
+        ));
+        let blanket = MarkovBlanket {
+            linked_from: vec![RelatedPage {
+                page_id: 2,
+                name: "SECRET-ONLY".into(),
+            }],
+            ..Default::default()
+        };
+        let mut blankets = HashMap::from([(1, blanket)]);
+        state
+            .filter_blankets(&mut blankets, &client, &HashMap::new())
+            .await;
+        assert!(blankets.get(&1).unwrap().linked_from.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timed_out_permission_checks_are_denied_and_counted() {
+        use axum::{extract::Path, http::StatusCode, routing::get, Router};
+
+        let app = Router::new().route(
+            "/api/pages/{id}",
+            get(|Path(id): Path<i64>| async move {
+                if id == 2 {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                StatusCode::OK
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = make_state("slow-acl", "http://unused".to_string()).await;
+        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "tid",
+            "tsecret",
+            reqwest::Client::new(),
+        ));
+        let (accessible, unverified) = state
+            .check_pages(&[1, 2], &client, Duration::from_millis(100))
+            .await;
+        assert_eq!(accessible, vec![1], "the slow page must fail closed");
+        assert_eq!(unverified, 1, "and the caller must be told");
+    }
+
+    #[tokio::test]
+    async fn blanket_filter_only_asks_bookstack_about_unknown_neighbors() {
+        use bsmcp_common::types::RelatedPage;
+        let page = |id| RelatedPage {
+            page_id: id,
+            name: format!("page {id}"),
+        };
+        // 2 and 3 already have verdicts from the candidate check; 4 is new.
+        let (base, counter) = mock_bookstack(vec![2, 4]).await;
+        let state = make_state("blanket-verdicts", "http://unused".to_string()).await;
+        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "tid",
+            "tsecret",
+            reqwest::Client::new(),
+        ));
+        let blanket = MarkovBlanket {
+            siblings: vec![page(2), page(3), page(4)],
+            ..Default::default()
+        };
+        let mut blankets = HashMap::from([(1, blanket)]);
+        let known = HashMap::from([(2, true), (3, false)]);
+        state.filter_blankets(&mut blankets, &client, &known).await;
+        let kept: Vec<i64> = blankets[&1].siblings.iter().map(|p| p.page_id).collect();
+        assert_eq!(kept, vec![2, 4], "denied page 3 must be dropped");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "only page 4 had no verdict yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_is_checked_per_token_and_after_revocation() {
+        use axum::{
+            extract::Path,
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        use std::sync::atomic::AtomicBool;
+
+        let visible = StdArc::new(AtomicBool::new(true));
+        let allowed = visible.clone();
+        let app = Router::new().route(
+            "/api/pages/{id}",
+            get(move |Path(id): Path<i64>, headers: HeaderMap| {
+                let allowed = allowed.clone();
+                async move {
+                    if id == 1
+                        && allowed.load(Ordering::SeqCst)
+                        && headers.get("authorization").and_then(|h| h.to_str().ok())
+                            == Some("Token admin:secret")
+                    {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = make_state("per-token-revocation", "http://unused".into()).await;
+        let admin: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "admin",
+            "secret",
+            reqwest::Client::new(),
+        ));
+        let limited: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "limited",
+            "secret",
+            reqwest::Client::new(),
+        ));
+        let invalid: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "invalid",
+            "secret",
+            reqwest::Client::new(),
+        ));
+        assert_eq!(state.filter_by_permission(&[1], &admin).await, vec![1]);
+        assert!(state.filter_by_permission(&[1], &limited).await.is_empty());
+        assert!(state.filter_by_permission(&[1], &invalid).await.is_empty());
+        visible.store(false, Ordering::SeqCst);
+        assert!(state.filter_by_permission(&[1], &admin).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_allow_is_rechecked_after_access_is_revoked() {
+        let (base, counter) = mock_bookstack(vec![]).await;
+        let state = make_state("revoked", "http://unused".to_string()).await;
+        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
+            &base,
+            "tid",
+            "tsecret",
+            reqwest::Client::new(),
+        ));
+        state
+            .db
+            .upsert_permission_cache_batch(&hash_token_id("tid"), &[(1, true)], now_unix_secs())
+            .await
+            .unwrap();
+        assert!(state.filter_by_permission(&[1], &client).await.is_empty());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn filter_by_permission_rechecks_caches() {
         let (base, counter) = mock_bookstack(vec![1, 2]).await;
         let state = make_state("counters", "http://unused".to_string()).await;
         let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
@@ -3049,20 +2752,21 @@ mod acl_fanout_tests {
         sorted.sort();
         assert_eq!(sorted, vec![1, 2]);
         let after_first = counter.load(Ordering::SeqCst);
-        assert_eq!(
-            after_first, 3,
+        assert!(
+            after_first >= 3,
             "every page should hit BookStack on a cold cache"
         );
 
-        // Second call: all three hit the in-memory cache. No new HTTP calls.
+        // Second call must recheck BookStack despite an in-memory cache hit.
         let r2 = state.filter_by_permission(&ids, &client).await;
         let mut sorted2 = r2;
         sorted2.sort();
         assert_eq!(sorted2, vec![1, 2]);
         let after_second = counter.load(Ordering::SeqCst);
         assert_eq!(
-            after_second, after_first,
-            "cache hit should suppress further HTTP fan-out"
+            after_second,
+            after_first + 3,
+            "every call must recheck BookStack"
         );
     }
 
@@ -3136,7 +2840,9 @@ mod acl_fanout_tests {
             .prefilter_pages_by_roles(&[1, 2, 3, 4, 5], &[10])
             .await
             .unwrap();
-        let by_pid: HashMap<i64, AclPrefilter> = verdicts.into_iter().collect();
+        let by_pid: HashMap<i64, bsmcp_common::types::AclPrefilter> =
+            verdicts.into_iter().collect();
+        use bsmcp_common::types::AclPrefilter;
         assert_eq!(by_pid.get(&1), Some(&AclPrefilter::Allow));
         assert_eq!(by_pid.get(&2), Some(&AclPrefilter::Deny));
         assert_eq!(by_pid.get(&3), Some(&AclPrefilter::DefaultOpen));
@@ -3144,14 +2850,9 @@ mod acl_fanout_tests {
         assert_eq!(by_pid.get(&5), Some(&AclPrefilter::Uncomputed));
     }
 
-    /// Lever a.5 — end-to-end: a search-shaped call to `filter_by_permission`
-    /// with the prefilter populated should skip the HTTP fallback for both
-    /// Allow and Deny verdicts. Only DefaultOpen + Uncomputed reach BookStack.
     #[tokio::test]
-    async fn filter_by_permission_uses_prefilter_to_skip_http() {
-        // Pages 1+2: Allow (role 10 matches). Page 3: Deny. Pages 4+5: DefaultOpen.
-        // The mock will count GET /api/pages/{id} hits — we expect exactly 2
-        // (the two default-open pages still need HTTP), not 5.
+    async fn filter_by_permission_prefilter_cannot_override_bookstack() {
+        // Pages 1+2: cached role allow, but BookStack denies access.
         let path = temp_sqlite_path("prefilter-e2e");
         let sqlite = Arc::new(SqliteDb::open(
             &path,
@@ -3199,253 +2900,11 @@ mod acl_fanout_tests {
         let accessible = state.filter_by_permission(&[1, 2, 3, 4, 5], &client).await;
         let mut sorted = accessible;
         sorted.sort();
-        // Page 1+2 allowed via prefilter, page 3 denied via prefilter,
-        // pages 4+5 admitted via HTTP fallback (default-open + mock allows).
-        assert_eq!(sorted, vec![1, 2, 4, 5]);
-        assert_eq!(
-            counters.pages.load(Ordering::SeqCst),
-            2,
-            "prefilter should suppress HTTP for Allow + Deny verdicts; only 2 default-open pages hit HTTP"
-        );
-    }
-
-    /// Lever b — kick path reserves the in-flight set and deduplicates so
-    /// a second concurrent search asking about the same page IDs sees them
-    /// as in-flight and skips re-spawning. We can verify this without
-    /// running the actual HTTP fan-out by injecting a role-context cache
-    /// that fails the role-context build (so the spawned task short-
-    /// circuits cleanly and releases the in-flight slots) — but the
-    /// `acl_recompute_inflight` set's deduplication happens *before* the
-    /// spawn fires, so the test can observe it without timing.
-    ///
-    /// Strategy: call `kick_background_acl_recompute` synchronously twice
-    /// in immediate succession with the same page IDs; both calls return
-    /// quickly (the underlying spawn is fire-and-forget) but the second
-    /// call's slot reservation must be empty because the first call holds
-    /// all the IDs. Read the in-flight set between calls.
-    #[tokio::test]
-    async fn acl_recompute_deduplicates_inflight() {
-        let path = temp_sqlite_path("recompute-dedup");
-        let sqlite = Arc::new(SqliteDb::open(
-            &path,
-            "test-encryption-key-thirty-two-chars-long",
-        ));
-        sqlite.init_semantic_tables().await.unwrap();
-        let core_db: Arc<dyn DbBackend> = sqlite.clone();
-        let semantic_db: Arc<dyn SemanticDb> = sqlite.clone();
-        let index_db: Arc<dyn IndexDb> = sqlite.clone();
-        let state = Arc::new(SemanticState::new(
-            semantic_db,
-            core_db,
-            index_db,
-            "http://unused".to_string(),
-            "test-webhook-secret-16chars".to_string(),
-        ));
-
-        // Use a BookStack base that returns 404 on list_roles so role-context
-        // build fails; the spawned task short-circuits and releases the slots.
-        // We don't care about the failure — we care about the dedup logic.
-        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
-            "http://127.0.0.1:1",
-            "tid",
-            "tsecret",
-            reqwest::Client::new(),
-        ));
-
-        // Block the inflight cleanup by pre-stuffing the set: simulate a
-        // long-running first kick by manually holding the 3 page IDs as
-        // in-flight, then call kick with the same IDs. Inflight set should
-        // not grow because every ID was already present, and the underlying
-        // task should not have any reservations to make.
-        {
-            let mut inflight = state.acl_recompute_inflight.write().await;
-            for pid in [10i64, 11, 12] {
-                inflight.insert(pid);
-            }
-        }
-        // Second call sees them all in-flight; should not increase the set.
-        state
-            .kick_background_acl_recompute(&client, vec![10, 11, 12])
-            .await;
-        let inflight_after = state.acl_recompute_inflight.read().await.clone();
-        assert_eq!(
-            inflight_after.len(),
-            3,
-            "in-flight set should not grow when every id is already in-flight"
-        );
-        assert!(inflight_after.contains(&10));
-        assert!(inflight_after.contains(&11));
-        assert!(inflight_after.contains(&12));
-    }
-
-    /// Lever b — backpressure: when the in-flight set is at the cap, the
-    /// kick path queues a global `acl_reconcile` job and returns instead of
-    /// fanning out per-page tasks.
-    #[tokio::test]
-    async fn acl_recompute_backpressure_queues_global_job() {
-        let path = temp_sqlite_path("recompute-backpressure");
-        let sqlite = Arc::new(SqliteDb::open(
-            &path,
-            "test-encryption-key-thirty-two-chars-long",
-        ));
-        sqlite.init_semantic_tables().await.unwrap();
-        let core_db: Arc<dyn DbBackend> = sqlite.clone();
-        let semantic_db: Arc<dyn SemanticDb> = sqlite.clone();
-        let index_db: Arc<dyn IndexDb> = sqlite.clone();
-        let state = Arc::new(SemanticState::new(
-            semantic_db,
-            core_db,
-            index_db,
-            "http://unused".to_string(),
-            "test-webhook-secret-16chars".to_string(),
-        ));
-        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
-            "http://127.0.0.1:1",
-            "tid",
-            "tsecret",
-            reqwest::Client::new(),
-        ));
-
-        // Stuff the in-flight set up to the cap.
-        {
-            let mut inflight = state.acl_recompute_inflight.write().await;
-            for pid in 1i64..=(ACL_RECOMPUTE_INFLIGHT_CAP as i64) {
-                inflight.insert(pid);
-            }
-        }
-        // Job queue should be empty before the kick.
-        let before = state.db.get_stats().await.unwrap().total_pages;
-        state
-            .kick_background_acl_recompute(&client, vec![9000, 9001])
-            .await;
-        // We don't count jobs here directly — instead, prove the kick path
-        // didn't grow the in-flight set (because backpressure bailed early).
-        let inflight = state.acl_recompute_inflight.read().await;
-        assert_eq!(
-            inflight.len(),
-            ACL_RECOMPUTE_INFLIGHT_CAP,
-            "backpressure path must not reserve more in-flight slots"
-        );
-        assert!(!inflight.contains(&9000));
-        let _ = before; // silence dead-code lint on unused total_pages
-    }
-
-    /// Lever c — request coalescing. Two concurrent searches asking
-    /// about the same `(token_hash, page_id)` must share the in-flight
-    /// `can_access_page` call instead of duplicating it. Verified by
-    /// driving the coalesced helper with a slow mock that holds each
-    /// response for ~50ms, then asserting the mock saw fewer HTTP hits
-    /// than the number of awaiters.
-    #[tokio::test]
-    async fn coalesced_can_access_page_dedups_concurrent_callers() {
-        use axum::extract::Path;
-        use axum::response::IntoResponse;
-        use axum::routing::get;
-        use axum::Router;
-
-        let counter: StdArc<AtomicUsize> = StdArc::new(AtomicUsize::new(0));
-        let ctr = counter.clone();
-        let app = Router::new().route(
-            "/api/pages/{id}",
-            get(move |Path(_id): Path<i64>| {
-                let ctr = ctr.clone();
-                async move {
-                    ctr.fetch_add(1, Ordering::SeqCst);
-                    // Hold long enough that concurrent callers overlap. The
-                    // coalescing path keeps the second + third caller off the
-                    // wire entirely.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    (
-                        axum::http::StatusCode::OK,
-                        axum::Json(serde_json::json!({"id": 1})),
-                    )
-                        .into_response()
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-        let base = format!("http://{addr}");
-
-        let state = make_state("coalesce", "http://unused".to_string()).await;
-        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
-            &base,
-            "tid",
-            "tsecret",
-            reqwest::Client::new(),
-        ));
-
-        let s1 = state.clone();
-        let c1 = client.clone();
-        let s2 = state.clone();
-        let c2 = client.clone();
-        let s3 = state.clone();
-        let c3 = client.clone();
-
-        let token_hash = hash_token_id(client.token_id());
-        let token_hash_1 = token_hash.clone();
-        let token_hash_2 = token_hash.clone();
-        let token_hash_3 = token_hash.clone();
-
-        let (r1, r2, r3) = tokio::join!(
-            tokio::spawn(async move { s1.coalesced_can_access_page(&token_hash_1, 1, c1).await }),
-            tokio::spawn(async move { s2.coalesced_can_access_page(&token_hash_2, 1, c2).await }),
-            tokio::spawn(async move { s3.coalesced_can_access_page(&token_hash_3, 1, c3).await }),
-        );
-        assert!(r1.unwrap());
-        assert!(r2.unwrap());
-        assert!(r3.unwrap());
-        // Coalescing should cap HTTP calls below the 3-caller count. In
-        // practice the second + third are guaranteed to find the shared
-        // future under the mutex, so the mock sees exactly 1.
-        let observed = counter.load(Ordering::SeqCst);
+        // Only pages authorized by BookStack survive, regardless of indexed ACL.
+        assert_eq!(sorted, vec![4, 5]);
         assert!(
-            observed < 3,
-            "coalescing should suppress duplicate HTTP — saw {observed} hits for 3 concurrent callers"
-        );
-    }
-
-    /// Lever c — per-page timeout returns deny without holding the fan-out.
-    /// Verified by pointing the client at a server that never responds and
-    /// asserting the call finishes within the timeout budget with a deny.
-    #[tokio::test]
-    async fn coalesced_can_access_page_times_out_to_deny() {
-        // Bind a listener and never accept — connect attempts succeed but
-        // the response never arrives. With the 5s default that's still too
-        // slow for a unit test; lower it via env override for this call.
-        std::env::set_var("BSMCP_ACL_HTTP_TIMEOUT_SECS", "1");
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-        // Accept but never respond — keeps the connection open forever.
-        tokio::spawn(async move {
-            loop {
-                let _ = listener.accept().await;
-            }
-        });
-        let base = format!("http://{addr}");
-        let state = make_state("timeout", "http://unused".to_string()).await;
-        let client: Arc<dyn Backend> = Arc::new(BookStackClient::new(
-            &base,
-            "tid",
-            "tsecret",
-            reqwest::Client::new(),
-        ));
-        let token_hash = hash_token_id(client.token_id());
-
-        let started = Instant::now();
-        let ok = state
-            .coalesced_can_access_page(&token_hash, 1, client)
-            .await;
-        let elapsed = started.elapsed();
-        std::env::remove_var("BSMCP_ACL_HTTP_TIMEOUT_SECS");
-        assert!(!ok, "timeout should deny");
-        assert!(
-            elapsed < Duration::from_secs(3),
-            "timeout should bound elapsed time; saw {elapsed:?}"
+            counters.pages.load(Ordering::SeqCst) >= 5,
+            "all candidates need an authoritative check"
         );
     }
 
@@ -3487,8 +2946,7 @@ mod acl_fanout_tests {
             assert_eq!(counter.load(Ordering::SeqCst), 3);
         }
 
-        // Second "process": fresh state, same backing file. L1 is empty,
-        // but L2 still has the verdicts from the first session.
+        // Second process must recheck BookStack regardless of stale L2 rows.
         {
             let sqlite = Arc::new(SqliteDb::open(
                 &path,
@@ -3515,12 +2973,52 @@ mod acl_fanout_tests {
             let mut sorted = r;
             sorted.sort();
             assert_eq!(sorted, vec![10, 11]);
-            // No new HTTP traffic — L2 served every candidate.
             assert_eq!(
                 counter.load(Ordering::SeqCst),
-                3,
-                "L2 should suppress HTTP fan-out post-restart"
+                6,
+                "L2 cannot authorize after restart without rechecking BookStack"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_threshold_beats_model_default() {
+        assert_eq!(resolve_threshold(Some(0.9), Some(0.8), true), 0.9);
+    }
+
+    #[test]
+    fn model_default_replaces_legacy_default() {
+        assert_eq!(resolve_threshold(None, Some(0.8), true), 0.8);
+        assert_eq!(resolve_threshold(None, Some(0.8), false), 0.8);
+    }
+
+    #[test]
+    fn legacy_default_depends_on_hybrid_when_model_has_none() {
+        assert_eq!(resolve_threshold(None, None, true), 0.45);
+        assert_eq!(resolve_threshold(None, None, false), 0.50);
+    }
+
+    #[test]
+    fn embed_response_carries_optional_model_threshold() {
+        let with = json!({"embeddings": [[0.5, 0.25]], "default_threshold": 0.8});
+        assert_eq!(
+            parse_embed_response(&with).unwrap(),
+            (vec![0.5, 0.25], Some(0.8))
+        );
+        let without = json!({"embeddings": [[1.0]]});
+        assert_eq!(parse_embed_response(&without).unwrap(), (vec![1.0], None));
+        let null = json!({"embeddings": [[1.0]], "default_threshold": null});
+        assert_eq!(parse_embed_response(&null).unwrap(), (vec![1.0], None));
+    }
+
+    #[test]
+    fn embed_response_without_vector_is_an_error() {
+        assert!(parse_embed_response(&json!({"embeddings": []})).is_err());
+        assert!(parse_embed_response(&json!({})).is_err());
     }
 }

@@ -199,14 +199,7 @@ async fn harness() -> Harness {
         Some("https://libstack.example.com"),
     );
     let client = cfg.client("lst-test-token", "", reqwest::Client::new());
-    let path = std::env::temp_dir().join(format!(
-        "bsmcp-libstack-{}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let path = std::env::temp_dir().join(format!("bsmcp-libstack-{}.db", uuid::Uuid::new_v4()));
     let sqlite = Arc::new(SqliteDb::open(
         &path,
         "test-encryption-key-thirty-two-chars-long",

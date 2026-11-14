@@ -1,6 +1,5 @@
 # BookStack MCP Server
 
-[![SafeSkill 50/100](https://img.shields.io/badge/SafeSkill-50%2F100_Use%20with%20Caution-orange)](https://safeskill.dev/scan/bees-roadhouse-bookstack-mcp)
 An MCP (Model Context Protocol) server that gives Claude full access to a [BookStack](https://www.bookstackapp.com/) instance. Built in Rust with tokio/axum as a Cargo workspace with pluggable database backends and optional semantic vector search.
 
 ## Features
@@ -149,7 +148,7 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_REFRESH_TOKEN_TTL` | No | `7776000` | Refresh token TTL in seconds (90d) |
 | `BSMCP_BACKUP_INTERVAL` | No | - | Hours between backups (0 = disabled) |
 | `BSMCP_BACKUP_PATH` | No | `/data/backups` | Backup directory |
-| `BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN` | No | `180` | Per-process BookStack API request cap. Lower if multiple processes share a token and you see 429s. |
+| `BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN` | No | `180` | Per-process BookStack API request cap; an additional 60 req/min per-credential bucket (90-request initial burst) prevents one account from sustaining the whole process budget (override with `BSMCP_BOOKSTACK_PER_TOKEN_RATE_LIMIT_PER_MIN` per process; the embedder/worker compose services set 180). Buckets hash the full credential and expire 10 minutes after the last client is released. The global cap still protects BookStack. Lower it if multiple processes share a token and you see 429s. |
 | `BSMCP_MAX_SESSIONS_PER_TOKEN` | No | `5` | Concurrent legacy SSE sessions allowed per API token. Raise it when one token is shared by several MCP clients on a host. Zero or unparseable values fall back to the default. |
 | `BSMCP_STRUCTURE_CACHE_TTL_SECS` | No | `60` | How long the `initialize` structure blurb is cached, per instance + API token. Without it every client connect re-enumerates the whole shelf tree (~1 API call per shelf). `0` disables caching. Tool responses are never cached, and a sweep that hit upstream errors is never cached. The cache is per process, so at N replicas expect the hit rate to divide by N. |
 
@@ -859,6 +858,7 @@ Uses fastembed with ONNX Runtime. No external API needed but requires the heavie
 | `BAAI/bge-large-en-v1.5` | 1024 | 335M | Highest quality, heavier. |
 | `BAAI/bge-small-en-v1.5` | 384 | 33M | Fastest, lower quality. |
 | `embeddinggemma-300m` | 768 | 300M | Google's lightweight model. |
+| `intfloat/multilingual-e5-small` | 384 | n/a (~450 MB ONNX download) | Multilingual, CPU-friendly. Query/passage prefixes and a model-specific default threshold of 0.83 are applied automatically when `threshold` is omitted. Calibrate the threshold on your own content. |
 
 ### Ollama
 
