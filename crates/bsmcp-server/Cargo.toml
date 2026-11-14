@@ -2,6 +2,7 @@
 name = "bsmcp-server"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 bsmcp-common = { path = "../bsmcp-common" }
