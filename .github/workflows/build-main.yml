@@ -30,7 +30,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  REPO_URL: https://github.com/bees-roadhouse/bookstack-mcp
+  REPO_URL: https://github.com/drbelt27/bookstack-mcp
 
 concurrency:
   group: build-main-${{ github.ref }}
@@ -90,10 +90,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:dev
-            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:dev-${{ needs.vars.outputs.short_sha }}
-            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:${{ needs.vars.outputs.version }}-dev
-            ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}:${{ needs.vars.outputs.version }}-dev-${{ needs.vars.outputs.short_sha }}
+            ${{ env.REGISTRY }}/drbelt27/${{ matrix.image }}:dev
+            ${{ env.REGISTRY }}/drbelt27/${{ matrix.image }}:dev-${{ needs.vars.outputs.short_sha }}
+            ${{ env.REGISTRY }}/drbelt27/${{ matrix.image }}:${{ needs.vars.outputs.version }}-dev
+            ${{ env.REGISTRY }}/drbelt27/${{ matrix.image }}:${{ needs.vars.outputs.version }}-dev-${{ needs.vars.outputs.short_sha }}
           labels: |
             org.opencontainers.image.source=${{ env.REPO_URL }}
             org.opencontainers.image.revision=${{ github.sha }}

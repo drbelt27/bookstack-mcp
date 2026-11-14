@@ -85,7 +85,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/bees-roadhouse/${{ matrix.image }}
+          images: ${{ env.REGISTRY }}/drbelt27/${{ matrix.image }}
           # `latest=auto` is metadata-action's default, stated explicitly so
           # the contract is readable here: a `v*` semver tag gets `:latest`,
           # a prerelease tag (v1.0.0-rc1) does not.
@@ -120,7 +120,7 @@ jobs:
   # Same shape; just keyed off a v* tag push instead of release-branch
   # push. **Delete in v0.14.0.**
   alias-worker-to-embedder-on-tag:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v0.13.')
     needs: [tag-release]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -160,8 +160,8 @@ jobs:
           for TAG in "${VERSION}" "${MAJOR_MINOR}" "${MAJOR}"; do
             echo "Aliasing bsmcp-worker:${TAG} -> bsmcp-embedder:${TAG}"
             docker buildx imagetools create \
-              -t "${{ env.REGISTRY }}/bees-roadhouse/bsmcp-worker:${TAG}" \
-              "${{ env.REGISTRY }}/bees-roadhouse/bsmcp-embedder:${TAG}"
+              -t "${{ env.REGISTRY }}/drbelt27/bsmcp-worker:${TAG}" \
+              "${{ env.REGISTRY }}/drbelt27/bsmcp-embedder:${TAG}"
           done
 
   github-release-on-tag:
@@ -194,11 +194,11 @@ jobs:
             ## Container images
 
             ```
-            docker pull ghcr.io/bees-roadhouse/bsmcp-server:${{ steps.vars.outputs.version }}
-            docker pull ghcr.io/bees-roadhouse/bsmcp-embedder:${{ steps.vars.outputs.version }}
+            docker pull ghcr.io/drbelt27/bsmcp-server:${{ steps.vars.outputs.version }}
+            docker pull ghcr.io/drbelt27/bsmcp-embedder:${{ steps.vars.outputs.version }}
             ```
 
-            > **Breaking change (v0.13.0):** `bsmcp-worker` was folded into `bsmcp-embedder`. The embedder image now accepts `--role={embedder|worker|both}` (CLI flag, primary) or `BSMCP_ROLE` (env fallback); default is `embedder`. For one release only, `ghcr.io/bees-roadhouse/bsmcp-worker:<tag>` is published as a registry alias of `ghcr.io/bees-roadhouse/bsmcp-embedder:<tag>` so existing compose files keep pulling. The alias is removed in v0.14.0. See the README's "From v0.12.x to v0.13.0" entry for compose changes.
+            > **Breaking change (v0.13.0):** `bsmcp-worker` was folded into `bsmcp-embedder`. The embedder image now accepts `--role={embedder|worker|both}` (CLI flag, primary) or `BSMCP_ROLE` (env fallback); default is `embedder`. The v0.13.0-only upstream `bsmcp-worker` alias is not required for v0.14.0; update compose files to run the embedder image with `--role=worker`. See the README's "From v0.12.x to v0.13.0" entry for compose changes.
 
             ## Native binaries (`bsmcp-server` only)
 

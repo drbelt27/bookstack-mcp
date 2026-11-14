@@ -148,7 +148,7 @@ Both Dockerfiles use BuildKit `--mount=type=cache` for `target/`, `~/.cargo/regi
 - **Build on merge, not on PR.** PR-time gating is fast (`cargo test` + `clippy`); image builds run once per merge. Removes the failure mode where a PR-time build has to complete for a downstream retag step to find an artifact — there is no downstream retag step.
 - **Pinned to `ubuntu-latest`.** GitHub-hosted runners are always available. Self-hosted runners can return as a per-job opt-in once a runner pool is reliable; for now no `[self-hosted, ...]` label appears in any workflow.
 - **Native binaries: server only.** `bsmcp-server` is pure Rust + bundled SQLite and cross-compiles cleanly. `bsmcp-embedder` depends on `fastembed` → ONNX Runtime → a per-platform C++ shared library; bare binaries would need ONNX Runtime installed on the host. Container is the only supported distribution for the embedder.
-- **External fork PRs are skipped.** Forks can't push to `ghcr.io/bees-roadhouse/*`. `verify-pr.yml` and `generate-artifacts.yml` gate on `head.repo.full_name == github.repository`.
+- **External fork PRs are skipped.** Forks can't push to `ghcr.io/drbelt27/*`. `verify-pr.yml` and `generate-artifacts.yml` gate on `head.repo.full_name == github.repository`.
 
 ### Tag conventions on GHCR
 
@@ -170,7 +170,7 @@ One trigger, one tag set — the whole list below lands on every `v*` tag:
 - `{major}.{minor}` and `{major}` — the rest of the semver hierarchy
 - `{version}-{sha}` — immutable per-release-commit
 
-Images are published to `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder` for `linux/amd64` and `linux/arm64`. For v0.13.0 only, `ghcr.io/bees-roadhouse/bsmcp-worker:<tag>` is published as a transitional registry alias of `ghcr.io/bees-roadhouse/bsmcp-embedder:<tag>` so existing compose files keep pulling — operators must still set `--role=worker` on the running container. The alias is removed in v0.14.0.
+Images are published to `ghcr.io/drbelt27/bsmcp-server` and `ghcr.io/drbelt27/bsmcp-embedder` for `linux/amd64` and `linux/arm64`. The v0.13.0 transitional `bsmcp-worker` alias was published in the upstream registry; this fork's v0.14.0 image runs the worker via `bsmcp-embedder --role=worker` instead.
 
 ### Native binary release artifacts
 
@@ -247,11 +247,11 @@ Normally CI handles this. For local multi-arch testing:
 ```bash
 docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
   -f docker/Dockerfile.server \
-  -t ghcr.io/bees-roadhouse/bsmcp-server:VERSION --push .
+  -t ghcr.io/drbelt27/bsmcp-server:VERSION --push .
 
 docker buildx build --builder multiarch --platform linux/amd64,linux/arm64 \
   -f docker/Dockerfile.embedder \
-  -t ghcr.io/bees-roadhouse/bsmcp-embedder:VERSION --push .
+  -t ghcr.io/drbelt27/bsmcp-embedder:VERSION --push .
 
 # v0.13.0: bsmcp-worker is the same image as bsmcp-embedder, selected
 # via --role=worker at run-time. No separate Dockerfile.

@@ -109,7 +109,7 @@ This starts three containers (server + embedder + worker) sharing a SQLite datab
 
 ### Run from source
 
-The project distributes as multi-arch (`linux/amd64` + `linux/arm64`) container images on GHCR — `ghcr.io/bees-roadhouse/bsmcp-server` and `ghcr.io/bees-roadhouse/bsmcp-embedder`. Native binaries for **`bsmcp-server` only** are attached to each GitHub Release for `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-aarch64`, and `windows-x86_64`. The embedder is **not** distributed as a bare binary — it depends on ONNX Runtime (a per-platform C++ shared library), so running it outside Docker is awkward. Either run the published embedder container, or build from source:
+The project builds multi-arch (`linux/amd64` + `linux/arm64`) container images on GHCR — `ghcr.io/drbelt27/bsmcp-server` and `ghcr.io/drbelt27/bsmcp-embedder` (check package visibility before pulling). Native binaries for **`bsmcp-server` only** are attached to each GitHub Release for `linux-x86_64`, `linux-aarch64`, `darwin-x86_64`, `darwin-aarch64`, and `windows-x86_64`. The embedder is **not** distributed as a bare binary — it depends on ONNX Runtime (a per-platform C++ shared library), so running it outside Docker is awkward. Either run the published embedder container, or build from source:
 
 ```bash
 # Server

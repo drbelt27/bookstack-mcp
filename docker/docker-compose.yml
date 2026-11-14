@@ -14,7 +14,7 @@ services:
       retries: 5
 
   bsmcp-server:
-    image: ghcr.io/bees-roadhouse/bsmcp-server:dev
+    image: ghcr.io/drbelt27/bsmcp-server:dev
     environment:
       BSMCP_DB_BACKEND: postgres
       BSMCP_DATABASE_URL: postgres://bsmcp:${BSMCP_DB_PASSWORD}@bsmcp-postgres/bsmcp
@@ -46,7 +46,7 @@ services:
         condition: service_healthy
 
   bsmcp-embedder:
-    image: ghcr.io/bees-roadhouse/bsmcp-embedder:dev
+    image: ghcr.io/drbelt27/bsmcp-embedder:dev
     cpus: ${BSMCP_EMBED_CPUS:-0}
     volumes:
       - bsmcp-models:/data/models
@@ -96,7 +96,7 @@ services:
   # operators should switch the `image:` line during the v0.13.x window.
   # The alias is removed in v0.14.0. See README "From v0.12.x to v0.13.0".
   bsmcp-worker:
-    image: ghcr.io/bees-roadhouse/bsmcp-embedder:dev
+    image: ghcr.io/drbelt27/bsmcp-embedder:dev
     command: ["bsmcp-embedder", "--role=worker"]
     environment:
       BSMCP_ROLE: worker
