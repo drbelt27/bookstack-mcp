@@ -167,11 +167,10 @@ async fn execute_tool(
             // at 10 so today's callers see no change.
             let limit = arg_i64(args, "limit", 10).clamp(1, 100) as usize;
             let hybrid = args.get("hybrid").and_then(|v| v.as_bool()).unwrap_or(true);
-            let default_threshold = if hybrid { 0.45 } else { 0.50 };
             let threshold = args
                 .get("threshold")
                 .and_then(|v| v.as_f64())
-                .unwrap_or(default_threshold) as f32;
+                .map(|t| t as f32);
             let verbose = args
                 .get("verbose")
                 .and_then(|v| v.as_bool())
@@ -243,6 +242,9 @@ async fn execute_tool(
                     &query, limit, threshold, hybrid, verbose, client, scope_arg, mode, rerank,
                 )
                 .await?;
+            if let Some(stats) = result.get_mut("stats").and_then(|v| v.as_object_mut()) {
+                add_acl_warning(stats);
+            }
             if !unknown_scopes.is_empty() {
                 // Surface unknown named scopes inline so the caller can
                 // notice (a typo, a deleted scope) without a hard error
@@ -826,8 +828,13 @@ async fn execute_tool(
             let staging_id = args.get("staging_id").and_then(|v| v.as_str());
             let url = args.get("url").and_then(|v| v.as_str());
             let (bytes, auto_filename, resolved_mime) = if let Some(sid) = staging_id {
-                let entry = crate::staging::consume_staged(staging, sid).await
-                    .ok_or_else(|| format!("Staging slot '{}' not found or already consumed (slots expire after 5 minutes)", sid))?;
+                let entry = crate::staging::consume_staged(
+                    staging,
+                    sid,
+                    &bsmcp_common::settings::hash_token_id(client.token_id()),
+                )
+                .await
+                .ok_or_else(|| format!("Staging slot '{}' not found or already consumed (slots expire after 5 minutes)", sid))?;
                 (entry.bytes, entry.filename, entry.mime_type)
             } else if let Some(u) = url {
                 let (b, f) = bookstack::resolve_file_content(None, Some(u))
@@ -1008,8 +1015,13 @@ async fn execute_tool(
             let staging_id = args.get("staging_id").and_then(|v| v.as_str());
             let url = args.get("url").and_then(|v| v.as_str());
             let (bytes, auto_filename, resolved_mime) = if let Some(sid) = staging_id {
-                let entry = crate::staging::consume_staged(staging, sid).await
-                    .ok_or_else(|| format!("Staging slot '{}' not found or already consumed (slots expire after 5 minutes)", sid))?;
+                let entry = crate::staging::consume_staged(
+                    staging,
+                    sid,
+                    &bsmcp_common::settings::hash_token_id(client.token_id()),
+                )
+                .await
+                .ok_or_else(|| format!("Staging slot '{}' not found or already consumed (slots expire after 5 minutes)", sid))?;
                 (entry.bytes, entry.filename, entry.mime_type)
             } else if let Some(u) = url {
                 let (b, f) = bookstack::resolve_file_content(None, Some(u))
@@ -1072,18 +1084,19 @@ async fn execute_tool(
                 format!("{base_url}/stage/upload/{staging_id}")
             };
             // Pre-register the slot so the staging_id acts as auth
-            {
-                let mut store = staging.write().await;
-                store.insert(
-                    staging_id.clone(),
-                    crate::staging::StagingEntry {
-                        bytes: Vec::new(),
-                        filename: String::new(),
-                        mime_type: String::new(),
-                        created_at: std::time::Instant::now(),
-                    },
-                );
-            }
+            crate::staging::register_slot(
+                staging,
+                staging_id.clone(),
+                crate::staging::StagingEntry {
+                    bytes: Vec::new(),
+                    filename: String::new(),
+                    mime_type: String::new(),
+                    created_at: std::time::Instant::now(),
+                    owner_hash: bsmcp_common::settings::hash_token_id(client.token_id()),
+                },
+                &crate::staging::StagingQuota::from_env(),
+            )
+            .await?;
             format_json(&json!({
                 "staging_id": staging_id,
                 "upload_url": upload_url,
@@ -2739,7 +2752,7 @@ pub fn tool_definitions(semantic_enabled: bool, backend: BackendKind) -> Vec<Val
                 "properties": {
                     "query": { "type": "string", "description": "Natural language search query. Include synonyms and related terms for better results." },
                     "limit": { "type": "integer", "description": "Max number of page results to return (capped at 100). Issue #80 raised the cap from 50 to 100 for precision-mode cascade callers.", "default": 10 },
-                    "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0). Default: 0.45 for hybrid, 0.50 for pure vector.", "default": 0.45 },
+                    "threshold": { "type": "number", "description": "Minimum cosine similarity score (0.0-1.0). Omit it to use the embedding model's calibrated default; models without one use 0.45 for hybrid, 0.50 for pure vector." },
                     "hybrid": { "type": "boolean", "description": "Combine vector + keyword search (default true). Set false for pure vector. Ignored in `precision` mode (cascade has its own keyword stage).", "default": true },
                     "verbose": { "type": "boolean", "description": "Include full Markov blanket data in results. Default false returns slim results (scores, chunks, scoring breakdown). Set true for full graph context.", "default": false },
                     "mode": {
@@ -3586,6 +3599,52 @@ mod tests {
             err.contains("v0.13.0"),
             "error must name the breaking-change release"
         );
+    }
+}
+
+/// Pages whose permission check timed out are withheld (fail closed). Say so
+/// in the response, otherwise an overloaded server looks like "no results".
+fn add_acl_warning(stats: &mut serde_json::Map<String, Value>) {
+    let unverified = stats
+        .get("acl_unverified")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if unverified > 0 {
+        stats.insert(
+            "warning".to_string(),
+            json!(format!(
+                "Results are incomplete: {unverified} candidate page(s) could not be permission-checked in time and were withheld. Wait a few seconds and retry."
+            )),
+        );
+    }
+}
+
+#[cfg(test)]
+mod acl_warning_tests {
+    use super::*;
+
+    #[test]
+    fn no_warning_when_every_page_was_verified() {
+        let mut stats = json!({"acl_unverified": 0});
+        add_acl_warning(stats.as_object_mut().unwrap());
+        assert!(stats.get("warning").is_none());
+    }
+
+    #[test]
+    fn warning_tells_the_caller_results_are_incomplete_and_to_retry() {
+        let mut stats = json!({"acl_unverified": 11});
+        add_acl_warning(stats.as_object_mut().unwrap());
+        let w = stats["warning"].as_str().unwrap();
+        assert!(w.contains("11"), "{w}");
+        assert!(w.contains("incomplete"), "{w}");
+        assert!(w.contains("retry"), "{w}");
+    }
+
+    #[test]
+    fn missing_field_adds_no_warning() {
+        let mut stats = json!({});
+        add_acl_warning(stats.as_object_mut().unwrap());
+        assert!(stats.get("warning").is_none());
     }
 }
 

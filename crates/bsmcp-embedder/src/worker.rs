@@ -1607,14 +1607,7 @@ mod reconcile_tests {
 
     fn temp_db() -> Arc<dyn IndexDb> {
         let dir = std_env::temp_dir();
-        let unique = format!(
-            "bsmcp-worker-test-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let unique = format!("bsmcp-worker-test-{}.db", uuid::Uuid::new_v4());
         let path = dir.join(unique);
         Arc::new(SqliteDb::open(
             &path,

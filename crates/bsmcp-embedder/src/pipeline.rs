@@ -22,6 +22,12 @@ struct ModelConfig {
     builtin: Option<EmbeddingModel>,
     hf_repo: &'static str,
     dims: usize,
+    /// E5 models are trained with these prefixes; without them retrieval degrades.
+    query_prefix: &'static str,
+    passage_prefix: &'static str,
+    /// Cosine cut-off calibrated for this model's score range; `None` keeps
+    /// the server's generic default.
+    default_threshold: Option<f32>,
 }
 
 /// Resolve a model name to its configuration.
@@ -31,16 +37,36 @@ fn resolve_model(name: &str) -> Option<ModelConfig> {
             builtin: Some(EmbeddingModel::BGELargeENV15),
             hf_repo: "BAAI/bge-large-en-v1.5",
             dims: 1024,
+            query_prefix: "",
+            passage_prefix: "",
+            default_threshold: None,
         }),
         "BAAI/bge-base-en-v1.5" => Some(ModelConfig {
             builtin: Some(EmbeddingModel::BGEBaseENV15),
             hf_repo: "BAAI/bge-base-en-v1.5",
             dims: 768,
+            query_prefix: "",
+            passage_prefix: "",
+            default_threshold: None,
         }),
         "BAAI/bge-small-en-v1.5" => Some(ModelConfig {
             builtin: Some(EmbeddingModel::BGESmallENV15),
             hf_repo: "BAAI/bge-small-en-v1.5",
             dims: 384,
+            query_prefix: "",
+            passage_prefix: "",
+            default_threshold: None,
+        }),
+        "intfloat/multilingual-e5-small" | "multilingual-e5-small" => Some(ModelConfig {
+            builtin: Some(EmbeddingModel::MultilingualE5Small),
+            hf_repo: "intfloat/multilingual-e5-small",
+            dims: 384,
+            query_prefix: "query: ",
+            passage_prefix: "passage: ",
+            // 0.83: IT/EN/ES study, 57 pages / 63 queries. Beside 0.84 it halves
+            // in-scope queries left empty (5% vs ~10%) and keeps cross-language
+            // hits (their median score is 0.830); F1 is flat across 0.82-0.84.
+            default_threshold: Some(0.83),
         }),
         "onnx-community/embeddinggemma-300m-ONNX"
         | "google/embeddinggemma-300m"
@@ -48,21 +74,34 @@ fn resolve_model(name: &str) -> Option<ModelConfig> {
             builtin: None,
             hf_repo: "onnx-community/embeddinggemma-300m-ONNX",
             dims: 768,
+            query_prefix: "",
+            passage_prefix: "",
+            default_threshold: None,
         }),
         _ => None,
     }
+}
+
+fn with_prefix(prefix: &str, texts: Vec<String>) -> Vec<String> {
+    if prefix.is_empty() {
+        return texts;
+    }
+    texts.into_iter().map(|t| format!("{prefix}{t}")).collect()
 }
 
 /// Thread-safe wrapper around the fastembed TextEmbedding model.
 pub struct EmbedModel {
     model: std::sync::Mutex<TextEmbedding>,
     dims: usize,
+    query_prefix: &'static str,
+    passage_prefix: &'static str,
+    default_threshold: Option<f32>,
 }
 
 impl EmbedModel {
     pub fn new(model_name: &str, cache_dir: &str) -> Result<Self, String> {
         let config = resolve_model(model_name)
-            .ok_or_else(|| format!("Unknown model: {model_name}. Supported: BAAI/bge-large-en-v1.5, BAAI/bge-base-en-v1.5, BAAI/bge-small-en-v1.5, embeddinggemma-300m"))?;
+            .ok_or_else(|| format!("Unknown model: {model_name}. Supported: BAAI/bge-large-en-v1.5, BAAI/bge-base-en-v1.5, BAAI/bge-small-en-v1.5, intfloat/multilingual-e5-small, embeddinggemma-300m"))?;
 
         let model = if let Some(builtin) = config.builtin {
             // Use fastembed's built-in model registry
@@ -84,6 +123,9 @@ impl EmbedModel {
         Ok(Self {
             model: std::sync::Mutex::new(model),
             dims: config.dims,
+            query_prefix: config.query_prefix,
+            passage_prefix: config.passage_prefix,
+            default_threshold: config.default_threshold,
         })
     }
 
@@ -92,8 +134,21 @@ impl EmbedModel {
         self.dims
     }
 
-    /// Embed a batch of texts. Thread-safe (locks internally).
+    pub fn default_threshold(&self) -> Option<f32> {
+        self.default_threshold
+    }
+
+    /// Embed document chunks. Thread-safe (locks internally).
     pub fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        self.run(with_prefix(self.passage_prefix, texts))
+    }
+
+    /// Embed search queries (the `/embed` endpoint).
+    pub fn embed_query(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        self.run(with_prefix(self.query_prefix, texts))
+    }
+
+    fn run(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
         let mut m = self
             .model
             .lock()
@@ -758,4 +813,59 @@ async fn embed_single_page(
         chunks: chunk_count,
         skipped: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multilingual_e5_small_uses_e5_prefixes_and_384_dims() {
+        let c = resolve_model("intfloat/multilingual-e5-small").unwrap();
+        assert_eq!(c.hf_repo, "intfloat/multilingual-e5-small");
+        assert_eq!(c.dims, 384);
+        assert_eq!(c.query_prefix, "query: ");
+        assert_eq!(c.passage_prefix, "passage: ");
+    }
+
+    #[test]
+    fn english_bge_models_get_no_prefix() {
+        let c = resolve_model("BAAI/bge-base-en-v1.5").unwrap();
+        assert_eq!((c.query_prefix, c.passage_prefix), ("", ""));
+    }
+
+    #[test]
+    fn e5_default_threshold_sits_in_the_calibrated_window() {
+        // Calibrated on a 57-page IT/EN/ES corpus: best F1 between 0.82 and
+        // 0.85. The generic server default (0.45/0.50) filters nothing for E5.
+        let t = resolve_model("intfloat/multilingual-e5-small")
+            .unwrap()
+            .default_threshold
+            .expect("E5 needs its own threshold");
+        assert!((0.82..=0.85).contains(&t), "got {t}");
+    }
+
+    #[test]
+    fn bge_models_keep_the_generic_server_default() {
+        for name in [
+            "BAAI/bge-small-en-v1.5",
+            "BAAI/bge-base-en-v1.5",
+            "BAAI/bge-large-en-v1.5",
+        ] {
+            assert_eq!(
+                resolve_model(name).unwrap().default_threshold,
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_is_prepended_to_every_text() {
+        assert_eq!(
+            with_prefix("query: ", vec!["ciao".into(), "hola".into()]),
+            vec!["query: ciao".to_string(), "query: hola".to_string()]
+        );
+        assert_eq!(with_prefix("", vec!["x".into()]), vec!["x".to_string()]);
+    }
 }

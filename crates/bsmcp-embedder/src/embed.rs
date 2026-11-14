@@ -11,6 +11,17 @@ pub trait Embedder: Send + Sync + 'static {
     /// Embed a batch of texts, returning one vector per text.
     async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String>;
 
+    /// Embed search queries. Providers whose model distinguishes queries from
+    /// documents override this; the rest embed them identically.
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        self.embed(texts).await
+    }
+
+    /// Similarity cut-off calibrated for this provider's model, if known.
+    fn default_threshold(&self) -> Option<f32> {
+        None
+    }
+
     /// Return the embedding dimension.
     fn dims(&self) -> usize;
 
@@ -435,6 +446,17 @@ impl Embedder for LocalEmbedder {
         tokio::task::spawn_blocking(move || model.embed(texts))
             .await
             .map_err(|e| format!("Embed task failed: {e}"))?
+    }
+
+    async fn embed_queries(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        let model = self.model.clone();
+        tokio::task::spawn_blocking(move || model.embed_query(texts))
+            .await
+            .map_err(|e| format!("Embed task failed: {e}"))?
+    }
+
+    fn default_threshold(&self) -> Option<f32> {
+        self.model.default_threshold()
     }
 
     fn dims(&self) -> usize {

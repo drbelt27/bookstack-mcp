@@ -1,3 +1,4 @@
+mod auth_guard;
 mod mcp;
 mod migrate;
 mod oauth;

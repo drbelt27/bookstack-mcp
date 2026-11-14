@@ -608,8 +608,12 @@ async fn handle_embed(
             .into_response();
     }
 
-    match state.embedder.embed(req.texts).await {
-        Ok(embeddings) => Json(json!({ "embeddings": embeddings })).into_response(),
+    match state.embedder.embed_queries(req.texts).await {
+        Ok(embeddings) => Json(json!({
+            "embeddings": embeddings,
+            "default_threshold": state.embedder.default_threshold(),
+        }))
+        .into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("Embedding failed: {e}")})),

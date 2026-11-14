@@ -67,6 +67,37 @@ fn is_restricted_ip(ip: &IpAddr) -> bool {
     }
 }
 
+async fn read_file_body(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("Failed to read URL response: {}", e))?
+    {
+        if chunk.len() > MAX_FILE_CONTENT_SIZE - bytes.len() {
+            return Err(format!(
+                "Remote file too large (limit {} bytes)",
+                MAX_FILE_CONTENT_SIZE
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn file_fetch_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none());
+    for addr in addrs {
+        builder = builder.resolve(host, *addr);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
 /// Resolve file content from either a local file path or a URL.
 /// Exactly one of file_path or url must be provided.
 /// Returns (bytes, filename).
@@ -122,15 +153,7 @@ pub async fn resolve_file_content(
 
             // Pin validated addresses into the client so reqwest uses them directly
             // instead of re-resolving DNS (prevents DNS rebinding attacks).
-            let mut client_builder = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(120));
-            for addr in &addrs {
-                client_builder = client_builder.resolve(host, *addr);
-            }
-            let client = client_builder
-                .build()
-                .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+            let client = file_fetch_client(host, &addrs)?;
 
             let resp = client
                 .get(url)
@@ -151,18 +174,7 @@ pub async fn resolve_file_content(
                 }
             }
 
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read URL response: {}", e))?;
-
-            if bytes.len() > MAX_FILE_CONTENT_SIZE {
-                return Err(format!(
-                    "Remote file too large: {} bytes (limit {})",
-                    bytes.len(),
-                    MAX_FILE_CONTENT_SIZE
-                ));
-            }
+            let bytes = read_file_body(resp).await?;
 
             let filename = url
                 .rsplit('/')
@@ -297,6 +309,7 @@ pub struct BookStackClient {
     token_id: String,
     token_secret: String,
     rate_limiter: RateLimiter,
+    per_token_limiter: RateLimiter,
 }
 
 impl Drop for BookStackClient {
@@ -309,6 +322,7 @@ impl Drop for BookStackClient {
 impl BookStackClient {
     pub fn new(base_url: &str, token_id: &str, token_secret: &str, client: Client) -> Self {
         let base_url = base_url.trim_end_matches('/').to_string();
+        let per_token_limiter = rate_limit::for_token(&base_url, token_id, token_secret);
         Self {
             client,
             public_url: base_url.clone(),
@@ -316,6 +330,7 @@ impl BookStackClient {
             token_id: token_id.to_string(),
             token_secret: token_secret.to_string(),
             rate_limiter: rate_limit::shared(),
+            per_token_limiter,
         }
     }
 
@@ -423,6 +438,7 @@ impl BookStackClient {
         builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, String> {
         for attempt in 0..Self::RETRY_429_MAX_ATTEMPTS {
+            self.per_token_limiter.acquire().await;
             self.rate_limiter.acquire().await;
             let req = builder
                 .try_clone()
@@ -507,6 +523,7 @@ impl BookStackClient {
         form: reqwest::multipart::Form,
     ) -> Result<Value, String> {
         // Multipart bodies stream and aren't `try_clone`-safe; skip retry.
+        self.per_token_limiter.acquire().await;
         self.rate_limiter.acquire().await;
         let resp = self
             .client
@@ -1389,6 +1406,79 @@ mod tests {
     use super::*;
     use reqwest::StatusCode;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn file_fetch_rejects_body_exceeding_limit_without_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let byte = stream.read_u8().await.unwrap();
+                request.push(byte);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..51 {
+                stream.write_all(b"100000\r\n").await.unwrap();
+                if stream.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                if stream.write_all(b"\r\n").await.is_err() {
+                    return;
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+        let client = file_fetch_client("example.com", &[address]).unwrap();
+        let response = client
+            .get(format!("http://example.com:{}/file", address.port()))
+            .send()
+            .await
+            .unwrap();
+        assert!(read_file_body(response).await.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_fetch_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let byte = stream.read_u8().await.unwrap();
+                request.push(byte);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/internal\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let client = file_fetch_client("example.com", &[address]).unwrap();
+        let response = client
+            .get(format!("http://example.com:{}/file", address.port()))
+            .send()
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+    }
 
     /// Simulate a BookStack list endpoint: `server_cap` is the instance's
     /// `API_MAX_ITEM_COUNT`, which clamps whatever `count` we asked for.
