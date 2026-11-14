@@ -37,9 +37,9 @@
 
 set -euo pipefail
 
-REGISTRY="ghcr.io/bees-roadhouse"
+REGISTRY="ghcr.io/drbelt27"
 PLATFORMS="linux/amd64,linux/arm64"
-REPO_URL="https://github.com/bees-roadhouse/bookstack-mcp"
+REPO_URL="https://github.com/drbelt27/bookstack-mcp"
 
 cd "$(git rev-parse --show-toplevel)"
 

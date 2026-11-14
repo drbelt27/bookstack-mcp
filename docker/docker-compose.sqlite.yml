@@ -4,7 +4,7 @@
 
 services:
   bsmcp-server:
-    image: ghcr.io/bees-roadhouse/bsmcp-server:dev
+    image: ghcr.io/drbelt27/bsmcp-server:dev
     volumes:
       - bsmcp-data:/data
     environment:
@@ -35,7 +35,7 @@ services:
       - "${BSMCP_PORT:-8080}:${BSMCP_PORT:-8080}"
 
   bsmcp-embedder:
-    image: ghcr.io/bees-roadhouse/bsmcp-embedder:dev
+    image: ghcr.io/drbelt27/bsmcp-embedder:dev
     cpus: ${BSMCP_EMBED_CPUS:-0}
     volumes:
       - bsmcp-data:/data
@@ -82,7 +82,7 @@ services:
   # of bsmcp-embedder:<tag> for one release only — switch the `image:`
   # line during the v0.13.x window. Alias removed in v0.14.0.
   bsmcp-worker:
-    image: ghcr.io/bees-roadhouse/bsmcp-embedder:dev
+    image: ghcr.io/drbelt27/bsmcp-embedder:dev
     command: ["bsmcp-embedder", "--role=worker"]
     volumes:
       - bsmcp-data:/data
