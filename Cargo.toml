@@ -11,6 +11,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 version = "0.14.0"
+license = "MIT"
 
 [workspace.dependencies]
 # Structured logging. `json` feature enables the JSON output mode that
