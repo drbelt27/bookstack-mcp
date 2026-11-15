@@ -148,9 +148,22 @@ The server is pure Rust + bundled SQLite and builds cleanly on any target the Ru
 | `BSMCP_REFRESH_TOKEN_TTL` | No | `7776000` | Refresh token TTL in seconds (90d) |
 | `BSMCP_BACKUP_INTERVAL` | No | - | Hours between backups (0 = disabled) |
 | `BSMCP_BACKUP_PATH` | No | `/data/backups` | Backup directory |
-| `BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN` | No | `180` | Per-process BookStack API request cap; an additional 60 req/min per-credential bucket (90-request initial burst) prevents one account from sustaining the whole process budget (override with `BSMCP_BOOKSTACK_PER_TOKEN_RATE_LIMIT_PER_MIN` per process; the embedder/worker compose services set 180). Buckets hash the full credential and expire 10 minutes after the last client is released. The global cap still protects BookStack. Lower it if multiple processes share a token and you see 429s. |
+| `BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN` | No | `180` | BookStack API request budget per MCP process. This is not a shared limit across the server, embedder, worker, or replicas. |
+| `BSMCP_BOOKSTACK_PER_TOKEN_RATE_LIMIT_PER_MIN` | No | `60` | Per-credential budget in each process (initial burst: 90 requests). The Compose services all use 60 by default. |
 | `BSMCP_MAX_SESSIONS_PER_TOKEN` | No | `5` | Concurrent legacy SSE sessions allowed per API token. Raise it when one token is shared by several MCP clients on a host. Zero or unparseable values fall back to the default. |
 | `BSMCP_STRUCTURE_CACHE_TTL_SECS` | No | `60` | How long the `initialize` structure blurb is cached, per instance + API token. Without it every client connect re-enumerates the whole shelf tree (~1 API call per shelf). `0` disables caching. Tool responses are never cached, and a sweep that hit upstream errors is never cached. The cache is per process, so at N replicas expect the hit rate to divide by N. |
+
+### BookStack API request limits
+
+BookStack defaults to `API_REQUESTS_PER_MIN=180` per user. If the server, embedder and worker use the same BookStack account, their separate MCP buckets **do not add up to a shared cap**: three processes at 60/min can collectively consume 180/min, while initial bursts can exceed that. With distinct accounts, count the processes using each account separately. BookStack's own 429 response remains the final protection; MCP retries it, but a search can return incomplete results when an ACL check times out.
+
+For the default BookStack setting, keep `BSMCP_BOOKSTACK_PER_TOKEN_RATE_LIMIT_PER_MIN=60` and `BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN=180` across the Compose services. To increase capacity:
+
+1. On **your BookStack installation**, set `API_REQUESTS_PER_MIN=600` in BookStack's persistent configuration (for Docker, the BookStack service environment, not an MCP container). Recreate/restart BookStack and check the `X-RateLimit-Limit` response header on an authenticated `/api/books?count=1` request; it must report `600`. Do not edit a running container's `.env`: that change is lost when the container is recreated.
+2. Set `BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN` and `BSMCP_BOOKSTACK_PER_TOKEN_RATE_LIMIT_PER_MIN` in the MCP Compose `.env` and recreate the MCP services. For example, with BookStack at 600 and three processes sharing one account, start at `BSMCP_BOOKSTACK_RATE_LIMIT_PER_MIN=600` and `BSMCP_BOOKSTACK_PER_TOKEN_RATE_LIMIT_PER_MIN=120` per process. Leave room for other clients and bursts; these figures are a starting point, not a guarantee.
+3. Run wide and concurrent searches with the intended client accounts. Watch BookStack's HTTP 429s, MCP response `stats.acl_unverified`/`stats.warning`, latency, and BookStack CPU/RAM. Reduce limits or concurrency if results are incomplete. An ACL timeout fails closed and withholds the page; raising the limit alone does not fix a slow BookStack instance.
+
+Each replica has its own buckets. If several replicas or other integrations share an account, plan their **aggregate** traffic against BookStack's per-user limit; these environment settings do not enforce a distributed cap. Avoid exposing a larger BookStack budget without monitoring, because it permits higher load from any API client using that account.
 
 #### Embedder Variables
 
