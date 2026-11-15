@@ -216,9 +216,13 @@ Release: bump the workspace version in a normal PR to `main`, then tag the merge
 
 ## Testing
 
+Run the same checks as `verify-pr.yml` before opening a PR:
+
 ```bash
-cargo test
-cargo clippy
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 ## Adding a New Tool
