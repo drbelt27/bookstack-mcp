@@ -12,7 +12,6 @@
 - **Separate embedder** — background embedding service with pluggable backends (local ONNX, Ollama, OpenAI, Voyage)
 - **Cross-encoder reranker (optional)** — embedder exposes `POST /rerank` when `BSMCP_RERANK_PROVIDER` is configured. Three providers: `local` (in-process ONNX cross-encoder via fastembed, default `BAAI/bge-reranker-v2-m3`), `voyage` (Voyage's `/v1/rerank`), `openai` (any OpenAI-shape rerank endpoint — covers Voyage/Jina/Cohere-via-shim/self-hosted). Off by default; consumed by `semantic_search`'s `rerank: true` flag (refinement on the standard mode) + `mode: "precision"` (cascade), and by `search_content`'s `rerank: true` flag (v0.13.0).
 - **Server-side markdown to HTML conversion** — send markdown, server converts before sending to BookStack
-- **LibStack backend (v0.14.0)** — `BSMCP_BACKEND=libstack` points the same 59 tools at a [LibStack](https://github.com/bees-roadhouse/libstack) instance; shelves/books/chapters become a view over nested collections and three `*_collection` tools expose the real tree ([see below](CONFIGURATION.md#libstack-backend))
 - **Staging upload flow** — upload local images and attachments through a two-step staging endpoint without exposing local paths to the container ([see below](TOOLS.md#uploading-local-files-images--attachments))
 - **OAuth 2.1 support** — use as a Claude.ai or Claude Desktop custom connector without config files
 - **Encrypted token storage** — OAuth tokens encrypted at rest with AES-256-GCM
