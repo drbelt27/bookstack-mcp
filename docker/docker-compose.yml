@@ -42,6 +42,14 @@ services:
       PGID: ${PGID:-1000}
     ports:
       - "${BSMCP_PORT:-8080}:${BSMCP_PORT:-8080}"
+    # Liveness only: local /health, never calls BookStack. The server does NOT
+    # wait for the embedder (semantic degrades, everything else keeps working).
+    healthcheck:
+      test: ["CMD", "bsmcp-server", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     depends_on:
       bsmcp-postgres:
         condition: service_healthy
@@ -83,6 +91,14 @@ services:
       BSMCP_LOG_FORMAT: ${BSMCP_LOG_FORMAT:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
+    # Readiness: /ready is 200 only once the model is loaded. Generous
+    # start_period: the first model download can be slow (it retries in-process).
+    healthcheck:
+      test: ["CMD", "bsmcp-embedder", "healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
     depends_on:
       bsmcp-postgres:
         condition: service_healthy
@@ -120,6 +136,8 @@ services:
       BSMCP_LOG_FORMAT: ${BSMCP_LOG_FORMAT:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
+    # No healthcheck: the worker role has no HTTP port; Docker already tracks
+    # the process, and the worker exits non-zero if its task dies.
     depends_on:
       bsmcp-postgres:
         condition: service_healthy

@@ -4,6 +4,7 @@ pub mod bookstack;
 pub mod chunking;
 pub mod config;
 pub mod db;
+pub mod health;
 pub mod index;
 pub mod libstack;
 pub mod logging;

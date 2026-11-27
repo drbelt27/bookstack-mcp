@@ -32,6 +32,18 @@ async fn main() {
     if args.len() >= 2 && args[1] == "doctor" {
         std::process::exit(doctor::run(&args[2..]).await);
     }
+    // `bsmcp-server healthcheck`: container liveness probe against /health (no curl in image).
+    if args.len() >= 2 && args[1] == "healthcheck" {
+        let port = env::var("BSMCP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8080);
+        std::process::exit(if bsmcp_common::health::probe_ok(port, "/health") {
+            0
+        } else {
+            1
+        });
+    }
     if args.len() >= 2 && args[1] == "migrate" {
         // Migrate CLI is interactive: it writes user-facing progress on stderr
         // and exits. Tracing subscriber is intentionally not initialized for

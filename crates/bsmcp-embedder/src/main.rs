@@ -203,6 +203,18 @@ fn resolve_role() -> Role {
 
 #[tokio::main]
 async fn main() {
+    // `bsmcp-embedder healthcheck`: container probe against /ready (no curl in image).
+    if env::args().nth(1).as_deref() == Some("healthcheck") {
+        let port = env::var("BSMCP_EMBED_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8081);
+        std::process::exit(if bsmcp_common::health::probe_ok(port, "/ready") {
+            0
+        } else {
+            1
+        });
+    }
     bsmcp_common::logging::init("bsmcp-embedder");
     let role = resolve_role();
     tracing::info!(
