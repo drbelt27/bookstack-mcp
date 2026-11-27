@@ -174,7 +174,7 @@ Per-provider config blocks are documented under [Reranker Providers](#reranker-p
 
 ### LibStack backend
 
-Phase 1 of the LibStack migration ([design](https://kb.beesroadhouse.com/link/2507), issue #156). `BookStackClient` sits behind a `Backend` trait in `bsmcp-common`, and `LibStackClient` implements the same trait against LibStack's JSON `/api`. The dispatcher, the semantic-search ACL path, the embedder and the reconciliation worker all go through the trait, so every tool name, every connector and the semantic index keep working when the household moves off BookStack.
+Legacy compatibility backend inherited from upstream. It is not actively supported or validated by this project; the upstream repository is not publicly accessible. New deployments should use BookStack. The following reference is retained for existing installations.
 
 ```
 BSMCP_BACKEND=libstack
