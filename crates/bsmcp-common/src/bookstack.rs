@@ -69,11 +69,10 @@ fn is_restricted_ip(ip: &IpAddr) -> bool {
 
 async fn read_file_body(mut resp: reqwest::Response) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| format!("Failed to read URL response: {}", e))?
-    {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        let (kind, chain) = crate::net_error::describe(&e);
+        format!("Failed to read URL response ({kind}): {chain}")
+    })? {
         if chunk.len() > MAX_FILE_CONTENT_SIZE - bytes.len() {
             return Err(format!(
                 "Remote file too large (limit {} bytes)",
@@ -154,11 +153,17 @@ pub async fn resolve_file_content(
             // instead of re-resolving DNS (prevents DNS rebinding attacks).
             let client = file_fetch_client(host, &addrs)?;
 
-            let resp = client
-                .get(url)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to fetch URL '{}': {}", url, e))?;
+            let resp = client.get(url).send().await.map_err(|e| {
+                let (kind, chain) = crate::net_error::describe(&e);
+                tracing::warn!(kind, cause = %chain, "url_fetch_failed");
+                format!("Failed to fetch URL ({kind}): {chain}")
+            })?;
+            if resp.status().is_redirection() {
+                return Err(format!(
+                    "URL returned status {} (redirects are not followed; use the final direct URL)",
+                    resp.status()
+                ));
+            }
             if !resp.status().is_success() {
                 return Err(format!("URL returned status {}", resp.status()));
             }
@@ -442,10 +447,10 @@ impl BookStackClient {
             let req = builder
                 .try_clone()
                 .ok_or_else(|| "non-cloneable request".to_string())?;
-            let resp = req.send().await.map_err(|e| {
-                tracing::error!(error = %e, "bookstack_request_error");
-                "Request failed".to_string()
-            })?;
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| crate::net_error::log_and_message("bookstack_request_error", &e))?;
             if resp.status().as_u16() == 429 {
                 // Jitter both the parsed Retry-After and the exponential
                 // fallback. When the embedder + worker share a token they
@@ -531,10 +536,7 @@ impl BookStackClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "bookstack_request_error");
-                "Request failed".to_string()
-            })?;
+            .map_err(|e| crate::net_error::log_and_message("bookstack_request_error", &e))?;
         self.rate_limiter.observe_limit(resp.headers());
 
         if !resp.status().is_success() {
