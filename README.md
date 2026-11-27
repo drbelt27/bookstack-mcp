@@ -14,6 +14,8 @@ Connect your self-hosted [BookStack](https://www.bookstackapp.com/) or [LibStack
 
 **[Quick start](#setup) · [Features](#features) · [Available tools](#available-tools-59-bookstack--3-semantic--62) · [Configuration](#configuration) · [Report an issue](https://github.com/drbelt27/bookstack-mcp/issues)**
 
+[![Support me on Ko-fi](https://img.shields.io/badge/Support%20me%20on-Ko--fi-2eb327?logo=kofi&logoColor=white)](https://ko-fi.com/U5R22ATDML)
+
 </div>
 
 ---
@@ -1067,6 +1069,12 @@ If you're using Claude.ai or Claude Desktop, you can still use `upload_image` wi
 ## Development
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for build instructions, branching model, CI/CD (artifact-before-merge), versioning, and the workflow for adding new tools.
+
+## Support the project
+
+If BookStack MCP helps you get more out of your knowledge base, consider supporting its continued development on Ko-fi. Contributions are entirely optional — starring the repository, reporting issues and sharing feedback are also great ways to help.
+
+[![Support me on Ko-fi](https://img.shields.io/badge/Support%20me%20on-Ko--fi-2eb327?logo=kofi&logoColor=white)](https://ko-fi.com/U5R22ATDML)
 
 ## License
 
