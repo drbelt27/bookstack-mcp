@@ -125,6 +125,15 @@ fn resolve_threshold(explicit: Option<f32>, model_default: Option<f32>, hybrid: 
         .unwrap_or(if hybrid { 0.45 } else { 0.50 })
 }
 
+const EMBEDDER_UNAVAILABLE: &str =
+    "semantic search temporarily unavailable: embedder loading/degraded, retry later";
+
+/// The embedder answers 503 `embedder_not_ready` while its model loads (a
+/// disabled reranker is also a 503, with a different body).
+fn is_embedder_not_ready(body: &str) -> bool {
+    body.contains("embedder_not_ready")
+}
+
 fn parse_embed_response(body: &Value) -> Result<(Vec<f32>, Option<f32>), String> {
     let embedding = body
         .get("embeddings")
@@ -404,6 +413,7 @@ impl SemanticState {
     async fn embed_query(&self, query: &str) -> Result<(Vec<f32>, Option<f32>), String> {
         let url = format!("{}/embed", self.embedder_url);
         let mut last_err = String::new();
+        let mut unavailable = false;
 
         for attempt in 0..2 {
             if attempt > 0 {
@@ -421,6 +431,7 @@ impl SemanticState {
                 Ok(r) => r,
                 Err(e) => {
                     last_err = format!("Embedder request failed: {e}");
+                    unavailable = true;
                     continue;
                 }
             };
@@ -428,6 +439,7 @@ impl SemanticState {
             if resp.status().is_server_error() {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
+                unavailable = status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
                 last_err = format!("Embedder error {status}: {body}");
                 continue;
             }
@@ -446,7 +458,11 @@ impl SemanticState {
             return parse_embed_response(&body);
         }
 
-        Err(last_err)
+        Err(if unavailable {
+            EMBEDDER_UNAVAILABLE.to_string()
+        } else {
+            last_err
+        })
     }
 
     /// Drop blanket neighbors the caller cannot view. `known` holds verdicts
@@ -1083,10 +1099,14 @@ impl SemanticState {
             }))
             .send()
             .await
-            .map_err(|e| format!("Rerank request failed: {e}"))?;
+            .map_err(|e| format!("{EMBEDDER_UNAVAILABLE} ({e})"))?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            let body = resp.text().await.unwrap_or_default();
+            if is_embedder_not_ready(&body) {
+                return Err(EMBEDDER_UNAVAILABLE.to_string());
+            }
             return Err(
                 "Reranker is disabled on the embedder. Set BSMCP_RERANK_PROVIDER \
                  (local|voyage|openai) on the embedder to enable `rerank: true` \
@@ -3020,5 +3040,15 @@ mod threshold_tests {
     fn embed_response_without_vector_is_an_error() {
         assert!(parse_embed_response(&json!({"embeddings": []})).is_err());
         assert!(parse_embed_response(&json!({})).is_err());
+    }
+
+    #[test]
+    fn embedder_not_ready_body_is_detected() {
+        assert!(is_embedder_not_ready(
+            r#"{"error":"embedder_not_ready","status":{"state":"loading"}}"#
+        ));
+        assert!(!is_embedder_not_ready(
+            r#"{"error":"Reranker disabled (BSMCP_RERANK_PROVIDER unset or 'none')"}"#
+        ));
     }
 }
