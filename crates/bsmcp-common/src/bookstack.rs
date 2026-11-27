@@ -86,14 +86,13 @@ async fn read_file_body(mut resp: reqwest::Response) -> Result<Vec<u8>, String> 
 }
 
 fn file_fetch_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<Client, String> {
-    let mut builder = Client::builder()
+    // One call with every validated address: `resolve()` per address would
+    // overwrite the previous entry, leaving a single IP and no v4/v6 fallback.
+    Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(120))
-        .redirect(reqwest::redirect::Policy::none());
-    for addr in addrs {
-        builder = builder.resolve(host, *addr);
-    }
-    builder
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addrs)
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))
 }
@@ -1478,6 +1477,45 @@ mod tests {
             .unwrap();
         server.await.unwrap();
         assert_eq!(response.status(), StatusCode::FOUND);
+    }
+
+    /// Multi-address hostnames must keep every pinned IP: a dead address
+    /// (e.g. unroutable IPv6) in either position must not block the good one.
+    #[tokio::test]
+    async fn file_fetch_keeps_all_addresses_for_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for dead_first in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let good = listener.local_addr().unwrap();
+            // Same port, nothing listening on ::1 -> connection refused.
+            let dead =
+                std::net::SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), good.port());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+            });
+            let addrs = if dead_first {
+                [dead, good]
+            } else {
+                [good, dead]
+            };
+            let client = file_fetch_client("example.com", &addrs).unwrap();
+            let response = client
+                .get(format!("http://example.com:{}/file", good.port()))
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("dead_first={dead_first}: {e}"));
+            assert_eq!(response.status(), StatusCode::OK);
+            server.await.unwrap();
+        }
     }
 
     /// Simulate a BookStack list endpoint: `server_cap` is the instance's
