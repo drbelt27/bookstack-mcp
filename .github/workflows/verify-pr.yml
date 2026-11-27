@@ -58,3 +58,6 @@ jobs:
 
       - name: install/update script tests
         run: bash scripts/tests/test-scripts.sh
+
+      - name: smoke test script tests
+        run: bash scripts/tests/test-smoke.sh

@@ -141,18 +141,7 @@ Go to **Settings > Webhooks > Create Webhook** in your BookStack instance:
 - Page Update
 - Page Delete
 
-**Authentication:** The MCP expects the following header. Standard BookStack installations may not offer a custom-header field; in that case leave the webhook disabled and use periodic reconciliation until a supported authenticated integration is configured. Do not send unauthenticated requests.
-
-```text
-X-Webhook-Secret: YOUR_WEBHOOK_SECRET
-```
-
-For webhook senders that support custom headers, configure:
-```
-X-Webhook-Secret: YOUR_WEBHOOK_SECRET
-```
-
-The `YOUR_WEBHOOK_SECRET` value must match `BSMCP_WEBHOOK_SECRET` in your server environment. The server uses constant-time comparison to verify the header.
+**Authentication:** the MCP requires the header `X-Webhook-Secret: <BSMCP_WEBHOOK_SECRET>` (constant-time comparison). BookStack's webhook form cannot send custom headers, so add the header in your reverse proxy on `/webhooks/bookstack` only: see [Operations: webhook through your reverse proxy](OPERATIONS.md#webhook-through-your-reverse-proxy). Without a proxy, leave the webhook disabled and rely on periodic reconciliation. Do not send unauthenticated requests.
 
 After saving, any page create/update/delete in BookStack automatically queues a re-embedding job. The embedder picks it up within seconds (configurable via `BSMCP_EMBED_POLL_INTERVAL`).
 
