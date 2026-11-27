@@ -31,11 +31,12 @@ pub enum DbBackendType {
 
 impl DbBackendType {
     pub fn from_env() -> Self {
-        match std::env::var("BSMCP_DB_BACKEND")
-            .unwrap_or_else(|_| "sqlite".into())
-            .to_lowercase()
-            .as_str()
-        {
+        Self::from_env_str(std::env::var("BSMCP_DB_BACKEND").ok().as_deref())
+    }
+
+    /// Parse a `BSMCP_DB_BACKEND` value (None = default sqlite).
+    pub fn from_env_str(v: Option<&str>) -> Self {
+        match v.unwrap_or("sqlite").to_lowercase().as_str() {
             "postgres" | "postgresql" => Self::Postgres,
             _ => Self::Sqlite,
         }

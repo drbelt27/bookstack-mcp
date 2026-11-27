@@ -1,4 +1,5 @@
 mod auth_guard;
+mod doctor;
 mod mcp;
 mod migrate;
 mod oauth;
@@ -28,6 +29,9 @@ use bsmcp_common::time::TimezoneConfig;
 async fn main() {
     // Check for migration subcommand
     let args: Vec<String> = env::args().collect();
+    if args.len() >= 2 && args[1] == "doctor" {
+        std::process::exit(doctor::run(&args[2..]).await);
+    }
     if args.len() >= 2 && args[1] == "migrate" {
         // Migrate CLI is interactive: it writes user-facing progress on stderr
         // and exits. Tracing subscriber is intentionally not initialized for
