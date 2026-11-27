@@ -2,7 +2,7 @@
 
 [Project home](../README.md) · [Installation](INSTALLATION.md) · [Tools](TOOLS.md)
 
-### Configuration
+## Configuration
 
 #### Server Variables
 
@@ -140,7 +140,13 @@ Go to **Settings > Webhooks > Create Webhook** in your BookStack instance:
 - Page Update
 - Page Delete
 
-**Custom header** (required for verification):
+**Authentication:** The MCP expects the following header. Standard BookStack installations may not offer a custom-header field; in that case leave the webhook disabled and use periodic reconciliation until a supported authenticated integration is configured. Do not send unauthenticated requests.
+
+```text
+X-Webhook-Secret: YOUR_WEBHOOK_SECRET
+```
+
+For webhook senders that support custom headers, configure:
 ```
 X-Webhook-Secret: YOUR_WEBHOOK_SECRET
 ```
