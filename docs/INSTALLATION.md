@@ -132,3 +132,16 @@ Add to your MCP server configuration:
 
 The token ID and secret come from your BookStack API token (created under **My Account > Access & Security > API Tokens**).
 
+
+## Diagnostics
+
+Run the built-in doctor inside the running container:
+
+```
+docker compose exec bsmcp-server bsmcp-server doctor          # readable table
+docker compose exec bsmcp-server bsmcp-server doctor --json   # machine output
+```
+
+It checks config, database, backend reachability (IPv4/IPv6 per address), internet egress (skip with `BSMCP_DOCTOR_OFFLINE=1`), the server's own OAuth metadata, the embedder, and the API token. To validate the worker's token, pass `BSMCP_INDEX_TOKEN_ID`/`BSMCP_INDEX_TOKEN_SECRET` (or the `BSMCP_EMBED_TOKEN_*` pair) with `-e`. Exit code is 1 if any check FAILs.
+
+Not checkable from inside the container: iptables/nftables, host firewall, reverse proxy config, Docker daemon. `scripts/install.sh` covers the host-side checks.
