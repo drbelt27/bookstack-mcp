@@ -306,6 +306,25 @@ impl SemanticState {
         &self.webhook_secret
     }
 
+    /// The embedder's own `/health` JSON (model, load state, version), or
+    /// `None` if it is unreachable. Short timeout: this feeds a status page.
+    pub async fn embedder_health(&self) -> Option<Value> {
+        self.http_client
+            .get(format!("{}/health", self.embedder_url))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+
+    /// Pages with a stored ACL row, for the status page.
+    pub async fn acl_page_count(&self) -> Option<usize> {
+        self.db.list_acl_page_ids().await.ok().map(|v| v.len())
+    }
+
     /// Spawn the L2 permission-cache eviction task (issue #58 lever a).
     /// Wakes every [`PERMISSION_CACHE_EVICT_INTERVAL`] and deletes
     /// `permission_cache` rows older than the configured TTL. Cheap: one

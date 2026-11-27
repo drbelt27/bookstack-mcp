@@ -145,3 +145,7 @@ docker compose exec bsmcp-server bsmcp-server doctor --json   # machine output
 It checks config, database, backend reachability (IPv4/IPv6 per address), internet egress (skip with `BSMCP_DOCTOR_OFFLINE=1`), the server's own OAuth metadata, the embedder, and the API token. To validate the worker's token, pass `BSMCP_INDEX_TOKEN_ID`/`BSMCP_INDEX_TOKEN_SECRET` (or the `BSMCP_EMBED_TOKEN_*` pair) with `-e`. Exit code is 1 if any check FAILs.
 
 Not checkable from inside the container: iptables/nftables, host firewall, reverse proxy config, Docker daemon. `scripts/install.sh` covers the host-side checks.
+
+### System card on /status
+
+When semantic search is enabled, `/status` shows an admin-only **System** card (sign in through `/settings` first; non-admins see the page as before): server and embedder versions, embedder load state and model, last full/delta walk and deletion sweep, **last webhook received and last rejected** (a rejection means the secret header is missing or wrong, the usual reverse-proxy mistake), backup age, and a **Run diagnostics** button that runs the same checks as the CLI.

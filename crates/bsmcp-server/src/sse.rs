@@ -248,6 +248,11 @@ impl AppState {
         });
     }
 
+    /// `(interval in hours, backup directory)`; interval `None` = disabled.
+    pub fn backup_info(&self) -> (Option<u64>, PathBuf) {
+        (self.backup_interval_hours, self.backup_path.clone())
+    }
+
     pub fn spawn_backup(&self) {
         let Some(interval_hours) = self.backup_interval_hours else {
             return;
