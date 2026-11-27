@@ -243,12 +243,15 @@ impl ContentType {
         }
     }
 
+    /// Segment for `/api/content-permissions/{type}/{id}`. BookStack's
+    /// EntityProvider knows shelves as `bookshelf` there (not `shelf`, and not
+    /// the `/api/shelves` CRUD path); the public tool schema keeps `shelf`.
     fn as_str(&self) -> &str {
         match self {
             Self::Page => "page",
             Self::Chapter => "chapter",
             Self::Book => "book",
-            Self::Shelf => "shelf",
+            Self::Shelf => "bookshelf",
         }
     }
 }
@@ -1407,6 +1410,67 @@ mod tests {
     use super::*;
     use reqwest::StatusCode;
     use serde_json::json;
+
+    /// Real GET/PUT request lines for content-permissions, all four types:
+    /// shelves must hit `bookshelf` (BookStack's EntityProvider), the tool-facing
+    /// name stays `shelf`.
+    #[tokio::test]
+    async fn content_permissions_paths_use_bookshelf_for_shelves() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            for _ in 0..8 {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                // Headers + small JSON body arrive in one read on loopback.
+                let n = s.read(&mut buf).await.unwrap();
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req).to_string();
+                lines.push(text.lines().next().unwrap_or("").to_string());
+                s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+            }
+            lines
+        });
+
+        let client = BookStackClient::new(&base, "tid", "tsecret", reqwest::Client::new());
+        let types = ["page", "chapter", "book", "shelf"];
+        for t in types {
+            let ct = ContentType::parse_str(t).unwrap();
+            client.get_content_permissions(ct, 6).await.unwrap();
+        }
+        for t in types {
+            let ct = ContentType::parse_str(t).unwrap();
+            client
+                .update_content_permissions(ct, 6, &json!({"restricted": false}))
+                .await
+                .unwrap();
+        }
+        let lines = server.await.unwrap();
+        let expect = ["page", "chapter", "book", "bookshelf"];
+        for (i, seg) in expect.iter().enumerate() {
+            assert!(
+                lines[i].starts_with(&format!("GET /api/content-permissions/{seg}/6 ")),
+                "{}",
+                lines[i]
+            );
+            assert!(
+                lines[4 + i].starts_with(&format!("PUT /api/content-permissions/{seg}/6 ")),
+                "{}",
+                lines[4 + i]
+            );
+        }
+        // The public name is unchanged.
+        assert!(ContentType::parse_str("shelf").is_ok());
+        assert!(ContentType::parse_str("bookshelf").is_err());
+    }
 
     #[tokio::test]
     async fn file_fetch_rejects_body_exceeding_limit_without_content_length() {
