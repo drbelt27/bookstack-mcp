@@ -1,5 +1,6 @@
 mod embed;
 mod pipeline;
+mod ready;
 mod rerank;
 mod worker;
 
@@ -7,10 +8,11 @@ use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::{routing::get, Router};
 use serde::Deserialize;
@@ -67,18 +69,53 @@ impl Role {
     }
 }
 
-struct AppState {
+/// Everything that exists only once the model has loaded.
+struct Loaded {
     embedder: Arc<dyn Embedder>,
     model_name: String,
-    provider_name: String,
-    db: Arc<dyn SemanticDb>,
+    dims: usize,
     /// Reranker is optional — `BSMCP_RERANK_PROVIDER=none` (the default) leaves
     /// it unconfigured and `/rerank` returns 503.
     reranker: Option<Arc<dyn Reranker>>,
+}
+
+struct AppState {
+    /// Load progress, surfaced on `/health` and `/ready`.
+    status: ready::LoadStatus,
+    /// Set once by the background loader; `None` = not ready.
+    loaded: OnceLock<Loaded>,
+    provider_name: String,
+    db: Arc<dyn SemanticDb>,
     /// The role this process is running as. Surfaced on `/health` so
     /// operators can curl two compose services and verify the role flag
     /// actually took effect.
     role: Role,
+}
+
+/// 503 for `/embed` + `/rerank` while the model is not loaded.
+fn not_ready(state: &AppState) -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "embedder_not_ready", "status": state.status.to_json()})),
+    )
+        .into_response()
+}
+
+/// `/ready`: 200 only when loaded, else 503 with the state JSON.
+fn ready_response(
+    ready: bool,
+    status: &ready::LoadStatus,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(status.to_json()))
+}
+
+async fn handle_ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    ready_response(state.loaded.get().is_some(), &state.status)
 }
 
 /// Load or generate a persistent worker UUID from a file in the data directory.
@@ -377,12 +414,103 @@ async fn run_embedder(_db: Arc<dyn DbBackend>, db: Arc<dyn SemanticDb>, role: Ro
         spawn_embed_job_reconciler(db.clone());
     }
 
-    // Select embedding provider
+    // Select embedding provider. Config errors fail fast here; only the
+    // network-dependent load further down is retried.
     let provider = env::var("BSMCP_EMBED_PROVIDER")
         .unwrap_or_else(|_| "local".into())
         .to_lowercase();
+    validate_embedder_env(&provider);
 
-    let (embedder, model_name, dims): (Arc<dyn Embedder>, String, usize) = match provider.as_str() {
+    // Start HTTP server for /embed endpoint
+    let host = env::var("BSMCP_EMBED_HOST").unwrap_or_else(|_| "0.0.0.0".into());
+    let port: u16 = env::var("BSMCP_EMBED_PORT")
+        .unwrap_or_else(|_| "8081".into())
+        .parse()
+        .expect("BSMCP_EMBED_PORT must be a valid port number");
+
+    let state = Arc::new(AppState {
+        status: ready::LoadStatus::new(),
+        loaded: OnceLock::new(),
+        provider_name: provider.clone(),
+        db: db.clone(),
+        role,
+    });
+
+    let app = Router::new()
+        .route("/embed", axum::routing::post(handle_embed))
+        .route("/rerank", axum::routing::post(handle_rerank))
+        .route("/health", get(handle_health))
+        .route("/ready", get(handle_ready))
+        .with_state(state.clone());
+
+    let addr: SocketAddr = format!("{host}:{port}").parse().unwrap();
+
+    // Worker identity — persistent UUID for job ownership
+    let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
+    let worker_data_dir = PathBuf::from(env::var("BSMCP_EMBED_DATA_DIR").unwrap_or(model_path));
+    let worker_id = load_or_create_worker_id(&worker_data_dir);
+    tracing::info!(worker_id = %worker_id, "embedder_worker_id");
+
+    // Recover any jobs from a previous crash of this worker
+    match db.recover_worker_jobs(&worker_id).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(count = n, "embedder_recovered_jobs"),
+        Err(e) => tracing::error!(error = %e, "embedder_recover_jobs_failed"),
+    }
+
+    // Bind first so the container is reachable (and /health, /ready answer)
+    // while the model downloads; load + job worker run in the background.
+    tracing::info!(addr = %addr, "embedder_http_listening");
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+
+    let load_state = state.clone();
+    tokio::spawn(async move {
+        let cfg = ready::RetryCfg::from_env();
+        let loaded = ready::retry_load(&cfg, &load_state.status, || async {
+            let (embedder, model_name, dims) = load_embedder(&provider).await?;
+            tracing::info!(provider = %provider, model = %model_name, dims, "embedder_ready");
+            // Optional reranker; None when BSMCP_RERANK_PROVIDER is unset, "none", or empty.
+            let reranker = init_reranker().await;
+            Ok(Loaded {
+                embedder,
+                model_name,
+                dims,
+                reranker,
+            })
+        })
+        .await;
+        let Some(loaded) = loaded else { return };
+        let (embedder, model_name, dims) = (
+            loaded.embedder.clone(),
+            loaded.model_name.clone(),
+            loaded.dims,
+        );
+        let _ = load_state.loaded.set(loaded);
+        job_queue_worker(db, embedder, worker_id, model_name, dims).await;
+    });
+
+    axum::serve(listener, app).await.unwrap();
+}
+
+/// Fail-fast checks for config errors that retrying cannot fix.
+fn validate_embedder_env(provider: &str) {
+    if matches!(provider, "openai" | "voyage") {
+        env::var("BSMCP_EMBED_API_KEY").unwrap_or_else(|_| {
+            panic!(
+                "BSMCP_EMBED_API_KEY is required when BSMCP_EMBED_PROVIDER={provider} (role=embedder)"
+            )
+        });
+    }
+    if let Some(d) = env::var("BSMCP_EMBED_DIMS").ok().filter(|s| !s.is_empty()) {
+        d.parse::<usize>()
+            .expect("BSMCP_EMBED_DIMS must be a valid number");
+    }
+}
+
+/// Build the embedder for `provider`. Everything fallible here is
+/// network/IO-dependent, so callers retry on `Err`.
+async fn load_embedder(provider: &str) -> Result<(Arc<dyn Embedder>, String, usize), String> {
+    Ok(match provider {
         "openai" => {
             let api_key = env::var("BSMCP_EMBED_API_KEY").expect(
                 "BSMCP_EMBED_API_KEY is required when BSMCP_EMBED_PROVIDER=openai (role=embedder)",
@@ -406,7 +534,7 @@ async fn run_embedder(_db: Arc<dyn DbBackend>, db: Arc<dyn SemanticDb>, role: Ro
                             d
                         }
                         Err(e) => {
-                            panic!("Embedder: OpenAI dimension detection failed: {e}");
+                            return Err(format!("OpenAI dimension detection failed: {e}"));
                         }
                     }
                 };
@@ -444,7 +572,7 @@ async fn run_embedder(_db: Arc<dyn DbBackend>, db: Arc<dyn SemanticDb>, role: Ro
                             d
                         }
                         Err(e) => {
-                            panic!("Embedder: Voyage dimension detection failed: {e}");
+                            return Err(format!("Voyage dimension detection failed: {e}"));
                         }
                     }
                 };
@@ -477,13 +605,7 @@ async fn run_embedder(_db: Arc<dyn DbBackend>, db: Arc<dyn SemanticDb>, role: Ro
                             d
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                provider = "ollama",
-                                error = %e,
-                                default = 768,
-                                "embedder_dim_detect_failed_fallback"
-                            );
-                            768
+                            return Err(format!("Ollama dimension detection failed: {e}"));
                         }
                     }
                 };
@@ -510,88 +632,30 @@ async fn run_embedder(_db: Arc<dyn DbBackend>, db: Arc<dyn SemanticDb>, role: Ro
                 cache = %model_path,
                 "embedder_loading_local_model"
             );
-            let local = pipeline::EmbedModel::new(&model_name, &model_path)
-                .expect("Failed to load embedding model");
+            // shortcut: no explicit cache cleanup on failed load; hf-hub downloads to a
+            // part file and renames on completion (resumes next attempt), so a partial
+            // download is never mistaken for a valid cache. A corrupt-but-complete file
+            // would need manual deletion of the model dir; revisit if seen in the wild.
+            let (mn, mp) = (model_name.clone(), model_path.clone());
+            let local = tokio::task::spawn_blocking(move || pipeline::EmbedModel::new(&mn, &mp))
+                .await
+                .map_err(|e| format!("model load task failed: {e}"))??;
             let dims = local.dims();
             let local = Arc::new(local);
             tracing::info!(provider = "local", dims, "embedder_local_model_ready");
             let e = embed::LocalEmbedder::new(local);
             (Arc::new(e), model_name, dims)
         }
-    };
-
-    tracing::info!(
-        provider = %provider,
-        model = %model_name,
-        dims,
-        "embedder_ready"
-    );
-
-    // Optional reranker. None when BSMCP_RERANK_PROVIDER is unset, "none", or empty.
-    let reranker: Option<Arc<dyn Reranker>> = init_reranker().await;
-
-    // Start HTTP server for /embed endpoint
-    let host = env::var("BSMCP_EMBED_HOST").unwrap_or_else(|_| "0.0.0.0".into());
-    let port: u16 = env::var("BSMCP_EMBED_PORT")
-        .unwrap_or_else(|_| "8081".into())
-        .parse()
-        .expect("BSMCP_EMBED_PORT must be a valid port number");
-
-    let state = Arc::new(AppState {
-        embedder: embedder.clone(),
-        model_name: model_name.clone(),
-        provider_name: provider.clone(),
-        db: db.clone(),
-        reranker: reranker.clone(),
-        role,
-    });
-
-    let app = Router::new()
-        .route("/embed", axum::routing::post(handle_embed))
-        .route("/rerank", axum::routing::post(handle_rerank))
-        .route("/health", get(handle_health))
-        .with_state(state);
-
-    let addr: SocketAddr = format!("{host}:{port}").parse().unwrap();
-
-    // Worker identity — persistent UUID for job ownership
-    let model_path = env::var("BSMCP_MODEL_PATH").unwrap_or_else(|_| "/data/models".into());
-    let worker_data_dir = PathBuf::from(env::var("BSMCP_EMBED_DATA_DIR").unwrap_or(model_path));
-    let worker_id = load_or_create_worker_id(&worker_data_dir);
-    tracing::info!(worker_id = %worker_id, "embedder_worker_id");
-
-    // Recover any jobs from a previous crash of this worker
-    match db.recover_worker_jobs(&worker_id).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(count = n, "embedder_recovered_jobs"),
-        Err(e) => tracing::error!(error = %e, "embedder_recover_jobs_failed"),
-    }
-
-    // Spawn job queue worker
-    let worker_db = db.clone();
-    let worker_embedder = embedder.clone();
-    let worker_model_name = model_name;
-    let worker_dims = dims;
-    tokio::spawn(async move {
-        job_queue_worker(
-            worker_db,
-            worker_embedder,
-            worker_id,
-            worker_model_name,
-            worker_dims,
-        )
-        .await;
-    });
-
-    tracing::info!(addr = %addr, "embedder_http_listening");
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    })
 }
 
 async fn handle_embed(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbedRequest>,
 ) -> impl IntoResponse {
+    let Some(loaded) = state.loaded.get() else {
+        return not_ready(&state);
+    };
     if req.texts.is_empty() {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -608,10 +672,10 @@ async fn handle_embed(
             .into_response();
     }
 
-    match state.embedder.embed_queries(req.texts).await {
+    match loaded.embedder.embed_queries(req.texts).await {
         Ok(embeddings) => Json(json!({
             "embeddings": embeddings,
-            "default_threshold": state.embedder.default_threshold(),
+            "default_threshold": loaded.embedder.default_threshold(),
         }))
         .into_response(),
         Err(e) => (
@@ -623,9 +687,9 @@ async fn handle_embed(
 }
 
 async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let dims = state.embedder.dims();
+    let loaded = state.loaded.get();
     let stats = state.db.get_stats().await.ok();
-    let reranker = state.reranker.as_ref().map(|r| {
+    let reranker = loaded.and_then(|l| l.reranker.as_ref()).map(|r| {
         json!({
             "provider": r.provider_name(),
             "model": r.model_name(),
@@ -635,8 +699,9 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         "status": "ok",
         "role": state.role.as_str(),
         "provider": state.provider_name,
-        "model": state.model_name,
-        "dimensions": dims,
+        "model": loaded.map(|l| l.model_name.as_str()),
+        "dimensions": loaded.map(|l| l.embedder.dims()),
+        "load": state.status.to_json(),
         "reranker": reranker,
         "stats": stats.map(|s| json!({
             "total_pages": s.total_pages,
@@ -656,7 +721,10 @@ async fn handle_rerank(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RerankRequest>,
 ) -> impl IntoResponse {
-    let Some(reranker) = state.reranker.as_ref() else {
+    let Some(loaded) = state.loaded.get() else {
+        return not_ready(&state);
+    };
+    let Some(reranker) = loaded.reranker.as_ref() else {
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "Reranker disabled (BSMCP_RERANK_PROVIDER unset or 'none')"})),
@@ -1144,5 +1212,20 @@ mod role_tests {
         assert_eq!(Role::Embedder.as_str(), "embedder");
         assert_eq!(Role::Worker.as_str(), "worker");
         assert_eq!(Role::Both.as_str(), "both");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ready_is_503_until_loaded_then_200() {
+        let status = ready::LoadStatus::new();
+        let (code, body) = ready_response(false, &status);
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0["state"], "loading");
+        let (code, _) = ready_response(true, &status);
+        assert_eq!(code, StatusCode::OK);
     }
 }
