@@ -709,6 +709,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     });
     Json(json!({
         "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
         "role": state.role.as_str(),
         "provider": state.provider_name,
         "model": loaded.map(|l| l.model_name.as_str()),

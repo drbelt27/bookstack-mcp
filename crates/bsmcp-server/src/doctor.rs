@@ -25,7 +25,7 @@ pub enum Status {
 }
 
 impl Status {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Status::Pass => "PASS",
             Status::Warn => "WARN",
@@ -848,6 +848,20 @@ fn summarize(r: &Result<Resp, &'static str>) -> (Result<u16, &'static str>, bool
 
 pub async fn run(args: &[String]) -> i32 {
     let json_out = args.iter().any(|a| a == "--json");
+    let checks = collect_checks().await;
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&to_json(&checks)).unwrap_or_default()
+        );
+    } else {
+        print!("{}", to_table(&checks));
+    }
+    exit_code(&checks)
+}
+
+/// Every check, in order. Shared by the CLI and the `/status` button.
+pub async fn collect_checks() -> Vec<Check> {
     let env: Env = std::env::vars().collect();
     let mut checks = vec![check_config(&env)];
     let dbs = open_db(&env).await;
@@ -872,15 +886,7 @@ pub async fn run(args: &[String]) -> i32 {
             ));
         }
     }
-    if json_out {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&to_json(&checks)).unwrap_or_default()
-        );
-    } else {
-        print!("{}", to_table(&checks));
-    }
-    exit_code(&checks)
+    checks
 }
 
 #[cfg(test)]

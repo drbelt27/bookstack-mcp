@@ -94,7 +94,7 @@ pub fn build_session_cookie(session_id: &str) -> String {
     )
 }
 
-async fn resolve_session(
+pub(crate) async fn resolve_session(
     headers: &HeaderMap,
     store: &SettingsSessionStore,
 ) -> Option<(String, String)> {
@@ -158,7 +158,7 @@ pub struct SettingsForm {
     pub kb_scopes_json: Option<String>,
 }
 
-fn settings_post_origin_allowed(headers: &HeaderMap, known_urls: &[String]) -> bool {
+pub(crate) fn settings_post_origin_allowed(headers: &HeaderMap, known_urls: &[String]) -> bool {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     if known_urls.is_empty() {

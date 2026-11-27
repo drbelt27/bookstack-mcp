@@ -7,6 +7,7 @@ mod semantic;
 mod settings_ui;
 mod sse;
 mod staging;
+mod status_system;
 
 use std::env;
 use std::net::SocketAddr;
@@ -323,6 +324,10 @@ async fn main() {
             .route("/webhooks/bookstack", axum::routing::post(handle_webhook))
             .route("/status", get(handle_status))
             .route(
+                "/status/checks",
+                axum::routing::post(status_system::handle_checks),
+            )
+            .route(
                 "/jobs/embed/{id}/cancel",
                 axum::routing::post(handle_cancel_embed_job),
             )
@@ -395,6 +400,7 @@ async fn handle_webhook(
     let provided_secret = provided_secret.as_deref().unwrap_or("");
     let expected_secret = semantic.webhook_secret();
     if !sse::constant_time_eq(provided_secret, expected_secret) {
+        status_system::record_webhook_rejected(state.index_db.as_ref()).await;
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -402,6 +408,8 @@ async fn handle_webhook(
         Ok(v) => v,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
+
+    status_system::record_webhook_accepted(state.index_db.as_ref(), &payload).await;
 
     if let Err(e) = semantic.handle_webhook(&payload).await {
         tracing::error!(error = %e, "webhook_handler_error");
@@ -888,6 +896,8 @@ async fn handle_status(
         "idle".to_string()
     };
 
+    let system_section = status_system::render(&state, &headers).await;
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html><head>
@@ -935,6 +945,7 @@ async fn handle_status(
 </head><body>
 <div class="container">
   <h1>BookStack MCP — Embedding Status</h1>
+  {system_section}
   <div class="card">
     <div class="stat-row">
       <span class="stat-label">Indexed Pages</span>
