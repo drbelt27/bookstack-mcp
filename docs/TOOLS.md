@@ -27,7 +27,7 @@
 
 Semantic tools (`semantic_search`, `reembed`, `embedding_status`) only appear when `BSMCP_SEMANTIC_SEARCH=true` and an embedder is running. Without semantic search: 59 BookStack tools.
 
-With `BSMCP_BACKEND=libstack` the same 59 names stay and three more appear — `list_collections`, `get_collection`, `create_collection` — see [LibStack backend](CONFIGURATION.md#libstack-backend).
+For legacy installations only, with `BSMCP_BACKEND=libstack` the same 59 names stay and three more appear — `list_collections`, `get_collection`, `create_collection` — see [LibStack backend](CONFIGURATION.md#libstack-backend).
 
 The server is a thin BookStack CRUD facade plus semantic-search enrichment, OAuth, audit, and the reconciliation worker. Personal-memory primitives (journals, identities, reminders) and the v0.8.0/v0.9.0 briefing surface were removed in v0.10.0; v0.11.0 added the optional cross-encoder reranker on the embedder side; v0.13.0 (current) refactors that reranker from a third `semantic_search` mode into a flag on both `semantic_search` and `search_content` (breaking — see the v0.12 → v0.13 migration below). See the migration notes below.
 
