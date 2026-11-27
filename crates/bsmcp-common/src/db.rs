@@ -354,6 +354,9 @@ pub trait IndexDb: Send + Sync + 'static {
         limit: i64,
     ) -> Result<Vec<IndexedPage>, String>;
     async fn soft_delete_indexed_page(&self, page_id: i64) -> Result<(), String>;
+    /// Ids of every indexed page not soft-deleted. Used by the delta walk's
+    /// deletion sweep to diff against what the backend still lists.
+    async fn list_indexed_page_ids(&self) -> Result<Vec<i64>, String>;
 
     // --- Page cache ---
 

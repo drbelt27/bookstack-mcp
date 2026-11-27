@@ -224,6 +224,35 @@ pub trait Backend: Send + Sync + 'static {
     // --- Pages ---
 
     async fn list_pages(&self, count: i64, offset: i64) -> Result<Value, String>;
+    /// Every page id the token can see. Errors unless the backend's `total`
+    /// was reached: a short or total-less listing must never be mistaken for
+    /// "the other pages were deleted" by the deletion sweep.
+    async fn list_all_page_ids(&self) -> Result<Vec<i64>, String> {
+        let mut ids = Vec::new();
+        loop {
+            let resp = self.list_pages(500, ids.len() as i64).await?;
+            let rows = resp.get("data").and_then(|v| v.as_array());
+            let before = ids.len();
+            ids.extend(
+                rows.into_iter()
+                    .flatten()
+                    .filter_map(|p| p.get("id").and_then(|v| v.as_i64())),
+            );
+            let total = resp
+                .get("total")
+                .and_then(|v| v.as_i64())
+                .ok_or("page listing has no total")?;
+            if ids.len() as i64 >= total {
+                return Ok(ids);
+            }
+            if ids.len() == before {
+                return Err(format!(
+                    "page listing ended at {} of {total} pages",
+                    ids.len()
+                ));
+            }
+        }
+    }
     /// Pages with `updated_at` strictly after `since_iso_utc`, oldest first,
     /// at most `count` rows. Drives the index worker's delta walk.
     async fn list_pages_updated_since(

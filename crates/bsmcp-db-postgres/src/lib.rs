@@ -2223,6 +2223,14 @@ impl IndexDb for PostgresDb {
         Ok(())
     }
 
+    async fn list_indexed_page_ids(&self) -> Result<Vec<i64>, String> {
+        let rows = sqlx::query("SELECT page_id FROM bookstack_pages WHERE deleted = FALSE")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| format!("list_indexed_page_ids: {e}"))?;
+        Ok(rows.iter().map(|r| r.get::<i64, _>(0)).collect())
+    }
+
     // --- Page cache ---
 
     async fn get_page_cache(&self, page_id: i64) -> Result<Option<PageCache>, String> {

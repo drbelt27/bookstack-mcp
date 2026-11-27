@@ -58,6 +58,59 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// the worker task.
 const YIELD_EVERY: usize = 25;
 
+/// Largest sweep applied without a size check, and the share of the index
+/// above which a sweep is refused as "the token lost visibility", not
+/// "someone deleted that many pages".
+const SWEEP_FREE_DELETIONS: usize = 10;
+const SWEEP_MAX_FRACTION_PERCENT: usize = 20;
+
+/// Indexed pages the backend no longer lists, or why we must not trust that.
+/// Pure so the safety rules are testable.
+fn plan_deletions(indexed: &[i64], visible: &[i64]) -> Result<Vec<i64>, &'static str> {
+    if visible.is_empty() && !indexed.is_empty() {
+        return Err("backend lists no pages (token visibility lost?)");
+    }
+    let seen: HashSet<i64> = visible.iter().copied().collect();
+    let gone: Vec<i64> = indexed
+        .iter()
+        .copied()
+        .filter(|id| !seen.contains(id))
+        .collect();
+    if gone.len() > SWEEP_FREE_DELETIONS
+        && gone.len() * 100 > indexed.len() * SWEEP_MAX_FRACTION_PERCENT
+    {
+        return Err("sweep would remove too large a share of the index");
+    }
+    Ok(gone)
+}
+
+async fn apply_deletion_sweep(
+    index_db: &Arc<dyn IndexDb>,
+    semantic_db: Option<&Arc<dyn SemanticDb>>,
+    indexed: &[i64],
+    visible: &[i64],
+) -> Result<usize, String> {
+    let gone = match plan_deletions(indexed, visible) {
+        Ok(gone) => gone,
+        Err(reason) => {
+            tracing::warn!(reason, "indexworker_deletion_sweep_skipped");
+            return Ok(0);
+        }
+    };
+    for &page_id in &gone {
+        index_db.soft_delete_indexed_page(page_id).await?;
+        if let Some(sem) = semantic_db {
+            // Same cleanup as the page_delete webhook (semantic.rs).
+            sem.delete_page(page_id).await?;
+            let _ = sem.delete_page_acl(page_id).await;
+        }
+    }
+    if !gone.is_empty() {
+        tracing::info!(count = gone.len(), pages = ?gone, "indexworker_deleted_pages_removed");
+    }
+    Ok(gone.len())
+}
+
 /// Coverage version of the full walk, stamped alongside
 /// `last_full_walk_at`. Bump this when the walk's coverage semantics
 /// change in a way that makes previously-stamped walks incomplete — every
@@ -84,6 +137,9 @@ fn should_run_full_walk(last_full_walk_at: Option<&str>, stamped_version: Option
 pub(crate) struct IndexWorker {
     bs_client: Arc<dyn Backend>,
     index_db: Arc<dyn IndexDb>,
+    /// Lets the deletion sweep also drop chunks/embeddings and ACL rows,
+    /// like the `page_delete` webhook does. `None` = structure index only.
+    semantic_db: Option<Arc<dyn SemanticDb>>,
 }
 
 impl IndexWorker {
@@ -91,7 +147,13 @@ impl IndexWorker {
         Self {
             bs_client,
             index_db,
+            semantic_db: None,
         }
+    }
+
+    pub(crate) fn with_semantic(mut self, db: Arc<dyn SemanticDb>) -> Self {
+        self.semantic_db = Some(db);
+        self
     }
 
     /// Spawn the worker as a background tokio task. Returns the JoinHandle
@@ -592,6 +654,55 @@ impl IndexWorker {
             deferred,
             advanced_to = %advance_to,
             "indexworker_walk_delta_complete"
+        );
+        // The checkpoint is already stamped, so a sweep failure must not fail
+        // (and re-run) the delta itself.
+        if let Err(e) = self.maybe_sweep_deleted().await {
+            tracing::warn!(error = %e, "indexworker_deletion_sweep_failed");
+        }
+        Ok(())
+    }
+
+    /// Delta walks only see pages whose `updated_at` moved, so a deleted page
+    /// never shows up; the `page_delete` webhook was the only thing removing
+    /// it (and BookStack never retries a failed webhook). This diffs the ids
+    /// the backend still lists against the indexed ones, at most once per
+    /// `BSMCP_INDEX_DELETION_SWEEP_SECONDS` (default 3600, 0 disables).
+    async fn maybe_sweep_deleted(&self) -> Result<(), String> {
+        let every: i64 = env::var("BSMCP_INDEX_DELETION_SWEEP_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
+        if every <= 0 {
+            return Ok(());
+        }
+        let last: i64 = self
+            .index_db
+            .get_index_meta("last_deletion_sweep_at")
+            .await?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if current_unix() - last < every {
+            return Ok(());
+        }
+        // Indexed ids FIRST, visible ids second: a page indexed in between
+        // (webhook) is then absent from `indexed` instead of looking deleted.
+        let indexed = self.index_db.list_indexed_page_ids().await?;
+        let visible = self.bs_client.list_all_page_ids().await?;
+        let removed = apply_deletion_sweep(
+            &self.index_db,
+            self.semantic_db.as_ref(),
+            &indexed,
+            &visible,
+        )
+        .await?;
+        self.index_db
+            .set_index_meta("last_deletion_sweep_at", &current_unix().to_string())
+            .await?;
+        tracing::info!(
+            removed,
+            indexed = indexed.len(),
+            "indexworker_deletion_sweep_done"
         );
         Ok(())
     }
@@ -1904,5 +2015,81 @@ mod reconcile_tests {
         assert_eq!(parse_scope_id("shelf:927", "shelf:").unwrap(), 927);
         assert!(parse_scope_id("page:nope", "page:").is_err());
         assert!(parse_scope_id("all", "page:").is_err());
+    }
+}
+
+#[cfg(test)]
+mod deletion_sweep_tests {
+    use super::*;
+    use bsmcp_db_sqlite::SqliteDb;
+
+    #[test]
+    fn plan_removes_only_ids_the_backend_no_longer_lists() {
+        assert_eq!(plan_deletions(&[1, 2, 3, 4], &[1, 2, 3, 9]), Ok(vec![4]));
+        assert_eq!(plan_deletions(&[1, 2], &[1, 2]), Ok(vec![]));
+        assert_eq!(plan_deletions(&[], &[1, 2]), Ok(vec![]));
+    }
+
+    #[test]
+    fn plan_refuses_an_empty_listing() {
+        assert!(plan_deletions(&[1, 2, 3], &[]).is_err());
+        // Nothing indexed and nothing visible is simply a no-op.
+        assert_eq!(plan_deletions(&[], &[]), Ok(vec![]));
+    }
+
+    #[test]
+    fn plan_refuses_a_mass_deletion_but_allows_a_small_index_to_shrink() {
+        let indexed: Vec<i64> = (1..=100).collect();
+        let visible: Vec<i64> = (1..=50).collect(); // 50% gone
+        assert!(plan_deletions(&indexed, &visible).is_err());
+        let visible: Vec<i64> = (1..=85).collect(); // 15% gone, > free limit
+        assert_eq!(plan_deletions(&indexed, &visible).unwrap().len(), 15);
+        // Few pages, high share: still allowed (<= SWEEP_FREE_DELETIONS).
+        assert_eq!(plan_deletions(&[1, 2, 3, 4], &[1]).unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sweep_soft_deletes_missing_pages_in_a_real_sqlite_index() {
+        let path = std::env::temp_dir().join(format!("bsmcp-sweep-{}.db", uuid::Uuid::new_v4()));
+        let db: Arc<dyn IndexDb> = Arc::new(SqliteDb::open(
+            &path,
+            "test-encryption-key-thirty-two-chars-long",
+        ));
+        for id in 1..=4i64 {
+            let page = IndexedPage {
+                page_id: id,
+                book_id: 1,
+                chapter_id: None,
+                name: format!("p{id}"),
+                slug: format!("p{id}"),
+                url: None,
+                page_created_at: None,
+                page_updated_at: None,
+                identity_ouid: None,
+                page_kind: PageKind::Unclassified,
+                page_key: None,
+                archive_year: None,
+                indexed_at: 0,
+                deleted: false,
+            };
+            db.upsert_indexed_page(&page, None).await.unwrap();
+        }
+        let mut before = db.list_indexed_page_ids().await.unwrap();
+        before.sort();
+        assert_eq!(before, vec![1, 2, 3, 4]);
+
+        let removed = apply_deletion_sweep(&db, None, &before, &[1, 2, 3])
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        let mut after = db.list_indexed_page_ids().await.unwrap();
+        after.sort();
+        assert_eq!(after, vec![1, 2, 3]);
+        // A refused sweep changes nothing.
+        assert_eq!(
+            apply_deletion_sweep(&db, None, &after, &[]).await.unwrap(),
+            0
+        );
+        assert_eq!(db.list_indexed_page_ids().await.unwrap().len(), 3);
     }
 }
