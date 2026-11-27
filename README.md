@@ -4,7 +4,7 @@
 
 ### Your knowledge. Your AI. Your infrastructure.
 
-Connect your self-hosted [BookStack](https://www.bookstackapp.com/) or [LibStack](https://github.com/bees-roadhouse/libstack) knowledge base to AI assistants through the Model Context Protocol.
+Connect your self-hosted [BookStack](https://www.bookstackapp.com/) knowledge base to AI assistants through the Model Context Protocol.
 
 [![Development version](https://img.shields.io/github/toml/v/drbelt27/bookstack-mcp/main/Cargo.toml?label=development&query=%24.workspace.package.version)](Cargo.toml)
 [![Latest release](https://img.shields.io/github/v/release/drbelt27/bookstack-mcp?label=release)](https://github.com/drbelt27/bookstack-mcp/releases/latest)
@@ -47,7 +47,7 @@ Find answers in your existing knowledge base, write and maintain documentation, 
 ```mermaid
 flowchart LR
     A[AI assistant] -->|MCP / OAuth| B[BookStack MCP]
-    B -->|User-scoped API| C[BookStack or LibStack]
+    B -->|User-scoped API| C[BookStack]
     B --> D[(SQLite or PostgreSQL)]
     B -->|Query embeddings| E[Embedder]
     F[Index worker] --> C
@@ -68,7 +68,6 @@ Built in Rust with Tokio and Axum as a Cargo workspace with pluggable database b
 - **Multi-user OAuth 2.1:** individual API credentials, encrypted token storage and access checks on semantic results.
 - **Self-hosted:** SQLite or PostgreSQL with pgvector; Docker images for amd64 and arm64.
 - **MCP transports:** SSE and Streamable HTTP.
-- **LibStack support:** alternate backend with collection tools.
 
 See the [complete feature and architecture reference](docs/ARCHITECTURE.md).
 
@@ -113,7 +112,7 @@ For full setup and connection instructions, see [Installation](docs/INSTALLATION
 | Guide | Contents |
 |---|---|
 | [Installation](docs/INSTALLATION.md) | Deployment, native binaries, client connection |
-| [Configuration](docs/CONFIGURATION.md) | Environment variables, semantic search, providers, LibStack |
+| [Configuration](docs/CONFIGURATION.md) | Environment variables, semantic search and providers |
 | [MCP tools](docs/TOOLS.md) | Tool catalog, API endpoints, search and uploads |
 | [Architecture](docs/ARCHITECTURE.md) | Features and components |
 | [Migration guide](docs/MIGRATION.md) | Upgrade steps and historical breaking changes |
