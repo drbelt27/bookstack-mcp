@@ -6,8 +6,7 @@
 
 Connect your self-hosted [BookStack](https://www.bookstackapp.com/) knowledge base to AI assistants through the Model Context Protocol.
 
-[![Development version](https://img.shields.io/github/toml/v/drbelt27/bookstack-mcp/main/Cargo.toml?label=development&query=%24.workspace.package.version)](Cargo.toml)
-[![Latest release](https://img.shields.io/github/v/release/drbelt27/bookstack-mcp?label=release)](https://github.com/drbelt27/bookstack-mcp/releases/latest)
+[![Development version](https://img.shields.io/badge/development-v0.14.2-blue)](Cargo.toml)
 [![Build main](https://github.com/drbelt27/bookstack-mcp/actions/workflows/build-main.yml/badge.svg?branch=main)](https://github.com/drbelt27/bookstack-mcp/actions/workflows/build-main.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Built%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
@@ -121,6 +120,8 @@ For full setup and connection instructions, see [Installation](docs/INSTALLATION
 | [Development](DEVELOPMENT.md) | Build, tests and contribution workflow |
 
 ## Releases and packages
+
+Current development version: **0.14.2**. No versioned GitHub Release has been published yet. See [build status](https://github.com/drbelt27/bookstack-mcp/actions/workflows/build-main.yml) for the rolling development stream.
 
 - [GitHub Releases](https://github.com/drbelt27/bookstack-mcp/releases) — versioned releases and native server archives when published.
 - [Server container](https://github.com/drbelt27/bookstack-mcp/pkgs/container/bsmcp-server) and [embedder container](https://github.com/drbelt27/bookstack-mcp/pkgs/container/bsmcp-embedder) — GHCR images.
