@@ -2612,6 +2612,24 @@ impl IndexDb for SqliteDb {
         .map_err(|e| format!("Task failed: {e}"))?
     }
 
+    async fn list_indexed_page_ids(&self) -> Result<Vec<i64>, String> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT page_id FROM bookstack_pages WHERE deleted = 0")
+                .map_err(|e| format!("list_indexed_page_ids: {e}"))?;
+            let ids = stmt
+                .query_map([], |r| r.get::<_, i64>(0))
+                .map_err(|e| format!("list_indexed_page_ids: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("list_indexed_page_ids: {e}"))?;
+            Ok(ids)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+    }
+
     // --- Page cache ---
 
     async fn get_page_cache(&self, page_id: i64) -> Result<Option<PageCache>, String> {

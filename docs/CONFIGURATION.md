@@ -100,6 +100,7 @@ Read when the embedder is running with `--role=worker` or `--role=both`. The wor
 | `BSMCP_DB_PATH` | No | `/data/bookstack-mcp.db` | SQLite path |
 | `BSMCP_DATABASE_URL` | If postgres | - | PostgreSQL connection string |
 | `BSMCP_INDEX_DELTA_INTERVAL_SECONDS` | No | `300` | Cadence of the periodic delta walk. `0` = disable the delta walk (webhook-driven only). |
+| `BSMCP_INDEX_DELETION_SWEEP_SECONDS` | No | `3600` | Minimum gap between deletion sweeps run at the end of a delta walk: pages the backend no longer lists are removed from the index (needed when webhooks are not delivered). The sweep is skipped, with a warning, if the listing is incomplete, empty, or would remove more than 20% of the index (above 10 pages). `0` = disable. |
 
 \* Required, but the fallback to `BSMCP_EMBED_TOKEN_*` covers most setups.
 

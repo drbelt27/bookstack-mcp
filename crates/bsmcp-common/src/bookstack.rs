@@ -1411,6 +1411,55 @@ mod tests {
     use reqwest::StatusCode;
     use serde_json::json;
 
+    /// Serve canned JSON bodies, one per request, then stop.
+    async fn serve_bodies(bodies: Vec<&'static str>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for body in bodies {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        base
+    }
+
+    /// The deletion sweep trusts this listing, so it must only succeed when
+    /// the backend's `total` was actually reached.
+    #[tokio::test]
+    async fn list_all_page_ids_requires_the_full_total() {
+        use crate::backend::Backend;
+        let new = |base: &str| BookStackClient::new(base, "t", "s", reqwest::Client::new());
+
+        let base = serve_bodies(vec![
+            r#"{"data":[{"id":1},{"id":2}],"total":3}"#,
+            r#"{"data":[{"id":7}],"total":3}"#,
+        ])
+        .await;
+        assert_eq!(new(&base).list_all_page_ids().await.unwrap(), vec![1, 2, 7]);
+
+        // Listing stops short of `total` -> error, never a partial list.
+        let base = serve_bodies(vec![
+            r#"{"data":[{"id":1}],"total":5}"#,
+            r#"{"data":[],"total":5}"#,
+        ])
+        .await;
+        assert!(new(&base).list_all_page_ids().await.is_err());
+
+        // No `total` at all -> cannot prove completeness.
+        let base = serve_bodies(vec![r#"{"data":[{"id":1}]}"#]).await;
+        assert!(new(&base).list_all_page_ids().await.is_err());
+    }
+
     /// Real GET/PUT request lines for content-permissions, all four types:
     /// shelves must hit `bookshelf` (BookStack's EntityProvider), the tool-facing
     /// name stays `shelf`.

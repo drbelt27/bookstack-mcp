@@ -390,7 +390,7 @@ async fn run_worker(
         .unwrap_or(300);
     tracing::info!(delta_interval_s = delta_interval, "worker_delta_interval");
 
-    let worker = worker::IndexWorker::new(bs_client, index_db);
+    let worker = worker::IndexWorker::new(bs_client, index_db).with_semantic(semantic_db.clone());
     let handle = worker.spawn(delta_interval, Some(semantic_db));
 
     // Block on the worker indefinitely. Crashes inside the spawned task
