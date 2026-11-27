@@ -1,0 +1,8 @@
+# Security- and supply-chain-sensitive paths need the maintainer's review.
+/.github/                         @drbelt27
+/docker/                          @drbelt27
+/scripts/                         @drbelt27
+/crates/bsmcp-server/src/oauth.rs @drbelt27
+/crates/bsmcp-common/src/acl.rs   @drbelt27
+/crates/bsmcp-common/src/bookstack.rs @drbelt27
+/Cargo.toml                       @drbelt27
