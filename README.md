@@ -110,6 +110,7 @@ For full setup and connection instructions, see [Installation](docs/INSTALLATION
 |---|---|
 | [Installation](docs/INSTALLATION.md) | Deployment, native binaries, client connection |
 | [Configuration](docs/CONFIGURATION.md) | Environment variables, semantic search and providers |
+| [Operations](docs/OPERATIONS.md) | Webhook through the proxy, backup and restore, smoke test |
 | [MCP tools](docs/TOOLS.md) | Tool catalog, API endpoints, search and uploads |
 | [Architecture](docs/ARCHITECTURE.md) | Features and components |
 | [Migration guide](docs/MIGRATION.md) | Upgrade steps and historical breaking changes |

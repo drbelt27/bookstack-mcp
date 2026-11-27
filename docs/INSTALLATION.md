@@ -1,6 +1,6 @@
 # Installation and connection
 
-[Project home](../README.md) · [Configuration](CONFIGURATION.md) · [Upgrading](MIGRATION.md)
+[Project home](../README.md) · [Configuration](CONFIGURATION.md) · [Operations](OPERATIONS.md) · [Upgrading](MIGRATION.md)
 
 ## Setup
 
