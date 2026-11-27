@@ -50,6 +50,44 @@ cargo run --release -p bsmcp-embedder
 
 The server is pure Rust + bundled SQLite and builds cleanly on any target the Rust toolchain supports. The embedder depends on [`fastembed`](https://crates.io/crates/fastembed), which links ONNX Runtime; the crate downloads a matching prebuilt at build time for common targets, but cross-compiling or running on uncommon platforms may require installing ONNX Runtime separately. For most users, running the embedder from the published container avoids that complexity entirely.
 
+## Guided installation
+
+`scripts/install.sh` prepares `.env` and picks the compose file; it does not start containers and never touches firewall, reverse proxy or system config.
+
+```bash
+scripts/install.sh                      # interactive
+scripts/install.sh --yes --db sqlite --semantic on \
+  --public-domain mcp.example.com --bookstack-url https://kb.example.com   # non-interactive
+scripts/install.sh --dry-run ...        # checks only, writes nothing
+```
+
+- Copies `.env.example` to `.env` only if missing; generates missing `BSMCP_ENCRYPTION_KEY`, `BSMCP_WEBHOOK_SECRET` and the postgres password; **never** regenerates an existing secret. `.env` is `chmod 600`.
+- If `.env` already exists the script runs in-place and asks before changing any value.
+- Values are written single-quoted only when needed, so both `docker compose` and `set -a; . ./.env` accept them.
+- Checks prerequisites, port conflicts, `docker compose config -q`, container egress and container access to the BookStack URL, then prints the next commands plus Apache and Nginx proxy snippets (SSE-friendly) as text.
+
+## Updating and rolling back
+
+```bash
+scripts/update.sh                       # bsmcp-server only
+scripts/update.sh --all                 # every service except postgres
+scripts/update.sh --service bsmcp-embedder --channel stable   # stable = :latest, or pass a tag
+scripts/update.sh --rollback            # previous image digests
+```
+
+The script refuses if nothing is running, takes a backup first (sqlite: `sqlite3 .backup` in the container, else copy of db + `-wal` + `-shm`; postgres: `pg_dump -Fc`) under `.bsmcp-update/backups/`, records the previous image digests in `.bsmcp-update/<timestamp>.json`, then pulls and restarts only the selected services (`up -d --no-deps`; never `down`, never volumes). It waits for healthy, shows logs on failure and runs `/health` and `bsmcp-server doctor` when available. Channel and rollback pins are kept in `.bsmcp-update/override.yml`; pass it as an extra `-f` in later manual compose commands. For production pin a version tag or digest instead of `:dev`.
+
+A rollback prints the exact restore commands but never runs them: if the new version ran a database migration, restoring the image alone may not be enough and the backup must be restored too.
+
+## Troubleshooting from real installs
+
+Seen on Ubuntu 24.04 with Virtualmin/Webmin:
+
+- **Container cannot reach the public BookStack URL** (works from the host): no NAT hairpin. Add `extra_hosts: ["kb.example.com:<LAN IP of the BookStack host>"]` to bsmcp-server, bsmcp-embedder and bsmcp-worker in a compose override. HTTPS and TLS verification stay on because the hostname is unchanged.
+- **Containers cannot download the Hugging Face model**: the host firewall (nftables, often managed by Webmin) blocks forwarding from Docker bridges. Allow forwarding and masquerade for `docker0`/`br-*`, restart Docker, then check with `docker run --rm curlimages/curl -sSI https://huggingface.co`.
+- **`.env` values with spaces** (e.g. `BSMCP_INSTANCE_DESC`) break `source .env` unless quoted: use single quotes, `BSMCP_INSTANCE_DESC='My knowledge base'`. The install script does this for you.
+- **Technical (embedder) token**: needs admin-level role permissions even though it only calls the read-only roles API.
+
 ## Connecting
 
 The MCP endpoint URL is:

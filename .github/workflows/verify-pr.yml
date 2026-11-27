@@ -55,3 +55,6 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      - name: install/update script tests
+        run: bash scripts/tests/test-scripts.sh
