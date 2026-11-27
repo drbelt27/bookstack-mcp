@@ -1,6 +1,60 @@
-# BookStack MCP Server
+<div align="center">
 
-An MCP (Model Context Protocol) server that gives Claude full access to a [BookStack](https://www.bookstackapp.com/) instance. Built in Rust with tokio/axum as a Cargo workspace with pluggable database backends and optional semantic vector search.
+# BookStack MCP
+
+### Your knowledge. Your AI. Your infrastructure.
+
+Connect your self-hosted [BookStack](https://www.bookstackapp.com/) or [LibStack](https://github.com/bees-roadhouse/libstack) knowledge base to AI assistants through the Model Context Protocol.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Built%20with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
+[![GitHub stars](https://img.shields.io/github/stars/drbelt27/bookstack-mcp?style=flat)](https://github.com/drbelt27/bookstack-mcp/stargazers)
+[![Docker](https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)](#setup)
+[![MCP](https://img.shields.io/badge/Protocol-MCP-555555)](https://modelcontextprotocol.io/)
+
+**[Quick start](#setup) · [Features](#features) · [Available tools](#available-tools-59-bookstack--3-semantic--62) · [Configuration](#configuration) · [Report an issue](https://github.com/drbelt27/bookstack-mcp/issues)**
+
+</div>
+
+---
+
+## Bring your documentation into the AI workflow
+
+Find answers in your existing knowledge base, write and maintain documentation, and work with images and attachments — from an MCP-compatible assistant such as ChatGPT or Claude.
+
+| Capability | What it means for your team |
+|---|---|
+| Natural-language discovery | Find relevant pages using optional hybrid semantic and keyword search, even when you do not know the exact wording. |
+| Documentation workflows | Create, edit, organize and export knowledge-base content directly through MCP tools. |
+| Individual access | Connect using per-user BookStack credentials and OAuth, with access checks on search results. |
+| Local embeddings | Run semantic indexing with local ONNX models; external embedding providers are optional. |
+| Flexible self-hosting | Choose SQLite or PostgreSQL with pgvector, and deploy using Docker on amd64 or arm64. |
+
+> **Example requests**
+>
+> - Find the procedure for restoring access when an employee forgets their password.
+> - Create an onboarding guide in our IT documentation book.
+> - Summarize the relevant maintenance procedures and link to their source pages.
+> - Update this page with a new section and an image hosted at an accessible public URL.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[AI assistant] -->|MCP / OAuth| B[BookStack MCP]
+    B -->|User-scoped API| C[BookStack or LibStack]
+    B --> D[(SQLite or PostgreSQL)]
+    B -->|Query embeddings| E[Embedder]
+    F[Index worker] --> C
+    F --> D
+    E --> D
+```
+
+Semantic search is optional. Local embedding inference can run without an external embedding API. If you connect a cloud AI assistant, the content returned to that assistant is subject to its own data handling policies.
+
+**Project status:** actively maintained continuation of the archived [bees-roadhouse/bookstack-mcp](https://github.com/bees-roadhouse/bookstack-mcp). Development images are available through GHCR. Check the release notes and deployment requirements before upgrading production systems.
+
+Built in Rust with Tokio and Axum as a Cargo workspace with pluggable database backends.
 
 ## Features
 
