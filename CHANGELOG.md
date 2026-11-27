@@ -7,6 +7,10 @@ Notable changes to this maintained continuation of BookStack MCP are recorded he
 - Refresh the repository landing page and organize the detailed documentation into dedicated guides.
 - Add release, development-version and build badges.
 
+## 0.14.3 — 2026-11-27 (development)
+
+- Fix `get_content_permissions` / `update_content_permissions` for shelves, which returned HTTP 500: BookStack's content-permissions API expects `bookshelf`. The tool schema still uses `shelf` (PR [#17](https://github.com/drbelt27/bookstack-mcp/pull/17)).
+
 ## 0.14.2 — 2026-11-27 (development)
 
 - Improve HTTP failure diagnostics by logging the underlying cause chain (PR [#9](https://github.com/drbelt27/bookstack-mcp/pull/9)).
