@@ -56,8 +56,6 @@ flowchart LR
 
 Semantic search is optional. Local embedding inference can run without an external embedding API. If you connect a cloud AI assistant, the content returned to that assistant is subject to its own data handling policies.
 
-**Project status:** actively maintained continuation of the archived [bees-roadhouse/bookstack-mcp](https://github.com/bees-roadhouse/bookstack-mcp). Development images are available through GHCR. Check the release notes and deployment requirements before upgrading production systems.
-
 Built in Rust with Tokio and Axum as a Cargo workspace with pluggable database backends.
 
 ## Features
