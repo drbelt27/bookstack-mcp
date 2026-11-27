@@ -552,10 +552,10 @@ impl LibStackClient {
             let req = builder
                 .try_clone()
                 .ok_or_else(|| "non-cloneable request".to_string())?;
-            let resp = req.send().await.map_err(|e| {
-                tracing::error!(error = %e, "libstack_request_error");
-                "Request failed".to_string()
-            })?;
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| crate::net_error::log_and_message("libstack_request_error", &e))?;
             if resp.status().as_u16() == 429 {
                 let base = resp
                     .headers()
@@ -627,10 +627,7 @@ impl LibStackClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "libstack_request_error");
-                "Request failed".to_string()
-            })?;
+            .map_err(|e| crate::net_error::log_and_message("libstack_request_error", &e))?;
         self.rate_limiter.observe_limit(resp.headers());
         if !resp.status().is_success() {
             let status = resp.status();

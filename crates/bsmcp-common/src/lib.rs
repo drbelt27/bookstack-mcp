@@ -7,6 +7,7 @@ pub mod db;
 pub mod index;
 pub mod libstack;
 pub mod logging;
+pub mod net_error;
 pub mod rate_limit;
 pub mod settings;
 pub mod time;
