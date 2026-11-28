@@ -19,7 +19,7 @@
 
 use std::env;
 
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{fmt, fmt::writer::BoxMakeWriter, prelude::*, EnvFilter};
 
 /// Initialize the global tracing subscriber for a binary.
 ///
@@ -29,6 +29,21 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 /// subsequent calls are a no-op (the `try_init` path swallows the
 /// "already set" error rather than panicking).
 pub fn init(binary_name: &'static str) {
+    init_with(binary_name, false);
+}
+
+/// Like [`init`] but writes records to stderr. Required by STDIO MCP mode,
+/// where stdout carries protocol messages only.
+pub fn init_stderr(binary_name: &'static str) {
+    init_with(binary_name, true);
+}
+
+fn init_with(binary_name: &'static str, stderr: bool) {
+    let writer = if stderr {
+        BoxMakeWriter::new(std::io::stderr)
+    } else {
+        BoxMakeWriter::new(std::io::stdout)
+    };
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let json_mode = env::var("BSMCP_LOG_FORMAT")
@@ -40,6 +55,7 @@ pub fn init(binary_name: &'static str) {
     // string-matching the message.
     if json_mode {
         let layer = fmt::layer()
+            .with_writer(writer)
             .json()
             .with_current_span(true)
             .with_span_list(false)
@@ -49,7 +65,10 @@ pub fn init(binary_name: &'static str) {
             .with(layer)
             .try_init();
     } else {
-        let layer = fmt::layer().compact().with_target(false);
+        let layer = fmt::layer()
+            .with_writer(writer)
+            .compact()
+            .with_target(false);
         let _ = tracing_subscriber::registry()
             .with(env_filter)
             .with(layer)
