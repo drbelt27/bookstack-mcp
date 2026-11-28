@@ -4,47 +4,74 @@
 
 ## Webhook through your reverse proxy
 
-**Why a proxy.** The MCP authenticates webhooks with the header `X-Webhook-Secret`. BookStack's webhook form has no field for custom headers (checked against v26.09.3: a webhook only has a name, endpoint and timeout), so BookStack's own requests are rejected with HTTP 401. Instead of putting the secret in the URL (it would land in access logs), let the reverse proxy in front of the MCP add the header on the webhook path only. The secret then never leaves your server.
+**Why a proxy.** The MCP authenticates webhooks with the header `X-Webhook-Secret`. BookStack's webhook form has no field for custom headers (checked against v26.09.3: a webhook only has a name, endpoint and timeout), so BookStack's own requests are rejected with HTTP 401. Instead of putting the secret in the URL (it would land in access logs), let the reverse proxy add the header on the webhook path.
 
-**1. Add the header on `/webhooks/bookstack` only.** Use your real `BSMCP_WEBHOOK_SECRET` value; do not paste it into tickets or the repository.
+> **Security rule: the header must only be added for requests that come from BookStack itself.** If the proxy adds the secret for every caller, anyone on the Internet who can reach `/webhooks/bookstack` is authenticated by the proxy and can send forged events (`page_delete`, `chapter_delete`, full re-index requests). Restrict the path by source address, as below. Do not skip that line.
 
-Apache (`mod_headers`), inside the vhost of the MCP host, before the catch-all `ProxyPass`:
+This guide is for a BookStack and an MCP on the **same host**. If BookStack runs elsewhere, restrict the path to that host's address instead of loopback.
+
+**1. Make BookStack reach the proxy over loopback.** From the host itself, the public name often arrives with the public address as source (NAT hairpin: check the `remote address` your access log shows for a request made from the host). To get a stable `127.0.0.1` source that does not depend on any public or LAN address, resolve the MCP name to loopback on this host only:
+
+```bash
+echo "127.0.0.1 mcp.example.com" | sudo tee -a /etc/hosts      # keep a copy of /etc/hosts first
+```
+
+This affects every local program, not containers (they have their own resolver settings). The webhook keeps its normal public URL.
+
+**2. Add the header on `/webhooks/bookstack`, loopback only.** Put the rule in its own file readable only by root (it contains the secret), and include it from the MCP vhost. Use your real `BSMCP_WEBHOOK_SECRET` value; never paste it into tickets or the repository.
+
+Apache (`mod_headers`), file `/etc/apache2/bsmcp-webhook.conf`, mode `640`, owner root:
 
 ```apache
 <Location "/webhooks/bookstack">
+  Require ip 127.0.0.1 ::1
   RequestHeader set X-Webhook-Secret "YOUR_BSMCP_WEBHOOK_SECRET"
 </Location>
 ```
 
-Nginx, next to the existing `location /` block:
+Then `Include /etc/apache2/bsmcp-webhook.conf` inside the vhosts for `:80` and `:443`. With Virtualmin do it through its own command so the setting survives panel saves, and check the result before relying on it:
+
+```bash
+virtualmin modify-web --domain mcp.example.com --add-directive "Include /etc/apache2/bsmcp-webhook.conf"
+apachectl configtest        # Virtualmin already reloads Apache after the change
+```
+
+Nginx, next to the existing `location /` block (same rule: only loopback may reach it):
 
 ```nginx
 location = /webhooks/bookstack {
+  allow 127.0.0.1;
+  allow ::1;
+  deny all;
   proxy_pass http://127.0.0.1:8080;
   proxy_set_header X-Webhook-Secret "YOUR_BSMCP_WEBHOOK_SECRET";
   proxy_set_header Host $host;
 }
 ```
 
-Restrict read access to that config file (`chmod 640`, root-owned): it now contains the secret.
+**3. Keep the MCP port off the network.** Publish it on localhost only (`127.0.0.1:8080:8080`, see `scripts/install.sh --help`) so nothing reaches the MCP unproxied.
 
-**2. Close the direct port.** A caller that reaches the MCP port directly skips the proxy and, without the header, gets 401, which is safe. But if the proxy is the only thing adding the secret, publish the port on localhost only (`127.0.0.1:8080:8080`, see `scripts/install.sh --help`) so nothing else on the network can reach the MCP unproxied.
+**4. Configure the webhook in BookStack** (Settings > Webhooks): endpoint `https://mcp.example.com/webhooks/bookstack`, events Page Create, Page Update, Page Delete (more are handled: see [Configuration](CONFIGURATION.md)), **Active** on.
+- Set a **short timeout** (a few seconds). With BookStack's default synchronous queue the webhook runs while the page is being saved, so a hung MCP would otherwise delay every save for the whole timeout.
+- If `ALLOWED_SSRF_HOSTS` is set in BookStack's `.env`, it must allow the endpoint host.
 
-**3. Create the webhook in BookStack** (Settings > Webhooks): endpoint `https://your-mcp-host/webhooks/bookstack`, events Page Create, Page Update, Page Delete (more are handled: see [Configuration](CONFIGURATION.md)). BookStack must reach that URL; if it runs on the same host as the proxy and the public name does not resolve from inside it, use the internal URL of the proxy.
-
-**4. Test it.**
+**5. Test it from both sides.**
 
 ```bash
-# Through the proxy the header is added, so the MCP accepts the (ignored) test event:
-curl -s -o /dev/null -w "%{http_code}\n" -X POST https://your-mcp-host/webhooks/bookstack \
-  -H 'Content-Type: application/json' -d '{"event":"smoketest_noop"}'     # expect 202
+# From OUTSIDE the host: must be refused, with or without a header (never 202).
+curl -s -o /dev/null -w "%{http_code}\n" -X POST https://mcp.example.com/webhooks/bookstack \
+  -H 'Content-Type: application/json' -d '{"event":"smoketest_noop"}'            # expect 403
+curl -s -o /dev/null -w "%{http_code}\n" -X POST https://mcp.example.com/webhooks/bookstack \
+  -H 'X-Webhook-Secret: wrong' -H 'Content-Type: application/json' -d '{"event":"smoketest_noop"}'   # expect 403
 
-# Straight to the MCP port, bypassing the proxy, there is no header: it must refuse.
-curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8080/webhooks/bookstack \
-  -H 'Content-Type: application/json' -d '{"event":"smoketest_noop"}'     # expect 401
+# From the host itself (goes over loopback): accepted, the test event is ignored.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST https://mcp.example.com/webhooks/bookstack \
+  -H 'Content-Type: application/json' -d '{"event":"smoketest_noop"}'            # expect 202
 ```
 
-Then edit a page in BookStack and open `/status` (admin): **Last webhook received** must show a few seconds ago. **Last webhook rejected** means a request arrived without the right header: the proxy rule is not matching that path.
+Then edit a page in BookStack and open `/status` (admin): **Last webhook received** must show a few seconds ago. **Last webhook rejected** means a request arrived without the right header: the rule is not matching, or BookStack is not arriving from loopback.
+
+**Roll back.** Remove the line from `/etc/hosts`, run `virtualmin modify-web --domain mcp.example.com --remove-directive "Include /etc/apache2/bsmcp-webhook.conf"`, and delete the file.
 
 **Limits to know.**
 - BookStack does not retry a failed webhook. An event lost while the MCP is down is lost; the periodic delta walk (`BSMCP_INDEX_DELTA_INTERVAL_SECONDS`) catches modified pages and, since the deletion sweep, deleted pages (hourly). Chapter/book/shelf deletions and permission changes still rely on webhooks or the next full walk.
