@@ -15,7 +15,20 @@ use bsmcp_common::index::{DirectoryNode, DirectoryNodeKind, DirectoryScope};
 use bsmcp_common::time::TimezoneConfig;
 use bsmcp_common::types::ScopeFilter;
 
-const PROTOCOL_VERSION: &str = "2025-03-26";
+/// MCP revisions this server speaks (tools-only, so the wire shape is the same
+/// across them). Newest first; used for `initialize` negotiation and the
+/// `MCP-Protocol-Version` header check. 2026-07-28 drops `initialize` and is
+/// deliberately not listed.
+pub const SUPPORTED_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Echo the client's version if supported, else offer our newest (spec rule).
+fn negotiate_version(requested: Option<&str>) -> &'static str {
+    SUPPORTED_VERSIONS
+        .iter()
+        .find(|v| Some(**v) == requested)
+        .copied()
+        .unwrap_or(SUPPORTED_VERSIONS[0])
+}
 
 /// Tools that need server-side state (the index DB, the HTTP staging
 /// endpoint). `index_db: None` is the local STDIO profile, which has neither,
@@ -52,7 +65,7 @@ pub async fn handle_request(
             Some(json_rpc_result(
                 id,
                 json!({
-                    "protocolVersion": PROTOCOL_VERSION,
+                    "protocolVersion": negotiate_version(params["protocolVersion"].as_str()),
                     "capabilities": { "tools": {} },
                     "serverInfo": {
                         "name": "BookStack MCP",
@@ -3031,6 +3044,14 @@ mod tests {
 
     /// Locks the precise tool name set so a briefing/session/dismiss-style
     /// addition trips this assertion before it ships.
+    #[test]
+    fn negotiates_protocol_version() {
+        assert_eq!(negotiate_version(Some("2025-06-18")), "2025-06-18");
+        assert_eq!(negotiate_version(Some("2024-11-05")), "2024-11-05");
+        assert_eq!(negotiate_version(Some("2099-01-01")), "2025-11-25");
+        assert_eq!(negotiate_version(None), "2025-11-25");
+    }
+
     #[test]
     fn tools_list_names_match_expected_set() {
         let tools = tool_definitions(true, BackendKind::BookStack);
