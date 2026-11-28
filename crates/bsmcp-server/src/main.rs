@@ -287,6 +287,8 @@ async fn main() {
     settings_ui::spawn_settings_cleanup(state.settings_sessions.clone());
 
     let mut app = Router::new()
+        // Streamable HTTP endpoint per the MCP spec; `/mcp/sse` stays for existing clients.
+        .route("/mcp", get(sse::handle_sse).post(sse::handle_streamable))
         .route(
             "/mcp/sse",
             get(sse::handle_sse).post(sse::handle_streamable),

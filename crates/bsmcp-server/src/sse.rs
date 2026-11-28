@@ -435,6 +435,9 @@ pub async fn resolve_credentials(
 }
 
 pub async fn handle_sse(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(resp) = transport_checks(&headers, &state.known_urls) {
+        return resp;
+    }
     tracing::debug!(method = "GET", route = "/mcp/sse", "sse_connect_attempt");
     let (mut token_id, mut token_secret) = match resolve_credentials(
         &headers,
@@ -672,12 +675,60 @@ pub async fn handle_message(
     StatusCode::ACCEPTED.into_response()
 }
 
+/// Streamable HTTP transport checks (MCP spec): reject a browser `Origin` we
+/// don't recognise (DNS-rebinding guard) and an unsupported
+/// `MCP-Protocol-Version`. Requests without `Origin` (every non-browser
+/// client) pass. The origin check is skipped when no public domain is
+/// configured, so existing installs keep working; extra origins can be added
+/// with `BSMCP_ALLOWED_ORIGINS` (comma-separated). Loopback origins are always
+/// allowed for local tooling.
+fn transport_checks(headers: &HeaderMap, known_urls: &[String]) -> Option<Response> {
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let origin = origin.trim_end_matches('/');
+        let extra = std::env::var("BSMCP_ALLOWED_ORIGINS").unwrap_or_default();
+        let allowed = known_urls.is_empty()
+            || known_urls.iter().any(|u| u == origin)
+            || extra
+                .split(',')
+                .any(|o| o.trim().trim_end_matches('/') == origin)
+            || ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+                .iter()
+                .any(|l| origin == *l || origin.starts_with(&format!("{l}:")));
+        if !allowed {
+            tracing::warn!(origin, "origin_rejected");
+            return Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "Origin not allowed"})),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    let version = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())?;
+    if mcp::SUPPORTED_VERSIONS.contains(&version) {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Unsupported MCP-Protocol-Version"})),
+        )
+            .into_response(),
+    )
+}
+
 pub async fn handle_streamable(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    tracing::debug!(method = "POST", route = "/mcp/sse", "streamable_request");
+    tracing::debug!(method = "POST", route = "/mcp", "streamable_request");
+    if let Some(resp) = transport_checks(&headers, &state.known_urls) {
+        return resp;
+    }
     let (token_id, token_secret) = match resolve_credentials(
         &headers,
         state.db.as_ref(),

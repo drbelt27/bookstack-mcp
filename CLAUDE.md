@@ -71,7 +71,7 @@ crates/
 
 **Two transports:**
 1. **SSE (MCP 2024-11-05):** Client connects GET `/mcp/sse` with Bearer token -> validates -> creates session -> client sends JSON-RPC to `/mcp/messages/?sessionId=<id>` -> response via SSE event.
-2. **Streamable HTTP (MCP 2025-03-26):** Client POSTs JSON-RPC to `/mcp/sse` with Bearer token -> validates -> returns JSON response directly. Used by claude.ai.
+2. **Streamable HTTP (MCP 2025-03-26 → 2025-11-25):** Client POSTs JSON-RPC to `/mcp` (alias of `/mcp/sse`, both kept; Origin checked against the public domain + `BSMCP_ALLOWED_ORIGINS`, `MCP-Protocol-Version` validated, version negotiated on initialize) with Bearer token -> validates -> returns JSON response directly. Used by claude.ai.
 
 **Key patterns:**
 - Tool definitions use helper fns: `tool()`, `paginated_schema()`, `id_schema()`, `name_desc_schema()`, `update_schema()`
