@@ -4,6 +4,7 @@ Notable changes to this maintained continuation of BookStack MCP are recorded he
 
 ## Unreleased
 
+- Fix the webhook proxy guide: the proxy must add `X-Webhook-Secret` only for requests from BookStack itself (loopback), otherwise the secret authenticates every caller on the Internet.
 - Refresh the repository landing page and organize the detailed documentation into dedicated guides.
 - Add release, development-version and build badges.
 
