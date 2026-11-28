@@ -17,11 +17,16 @@ use bsmcp_common::types::ScopeFilter;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
+/// Tools that need server-side state (the index DB, the HTTP staging
+/// endpoint). `index_db: None` is the local STDIO profile, which has neither,
+/// so they are hidden from `tools/list` and refused if called anyway.
+const LOCAL_ONLY_HIDDEN: [&str; 2] = ["directory", "prepare_upload"];
+
 pub async fn handle_request(
     request: &Value,
     client: &Arc<dyn Backend>,
     semantic: Option<&Arc<SemanticState>>,
-    index_db: &dyn IndexDb,
+    index_db: Option<&dyn IndexDb>,
     staging: &crate::staging::StagingStore,
     tz: &TimezoneConfig,
 ) -> Option<Value> {
@@ -58,10 +63,18 @@ pub async fn handle_request(
             ))
         }
         "notifications/initialized" => None,
-        "tools/list" => Some(json_rpc_result(
-            id,
-            json!({ "tools": tool_definitions(semantic.is_some(), client.kind()) }),
-        )),
+        "ping" => Some(json_rpc_result(id, json!({}))),
+        "tools/list" => {
+            let mut tools = tool_definitions(semantic.is_some(), client.kind());
+            if index_db.is_none() {
+                tools.retain(|t| {
+                    !t["name"]
+                        .as_str()
+                        .is_some_and(|n| LOCAL_ONLY_HIDDEN.contains(&n))
+                });
+            }
+            Some(json_rpc_result(id, json!({ "tools": tools })))
+        }
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -113,9 +126,12 @@ async fn execute_tool(
     args: &Value,
     client: &Arc<dyn Backend>,
     semantic: Option<&Arc<SemanticState>>,
-    index_db: &dyn IndexDb,
+    index_db: Option<&dyn IndexDb>,
     staging: &crate::staging::StagingStore,
 ) -> Result<String, String> {
+    if index_db.is_none() && LOCAL_ONLY_HIDDEN.contains(&name) {
+        return Err(format!("{name} is not available in STDIO mode"));
+    }
     match name {
         // Directory tree (issue #69) — scoped, depth-limited tree from the
         // bookstack_* index tables. Page-level ACL filter via BookStack's
@@ -131,6 +147,7 @@ async fn execute_tool(
             // descriptions / bodies.
             let include = arg_str_default(args, "include", "meta");
             validate_enum(&include, &["meta", "summary", "full"], "include")?;
+            let index_db = index_db.ok_or("directory: no index available")?;
             let tree = index_db
                 .read_directory_tree(scope, depth)
                 .await

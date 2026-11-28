@@ -656,7 +656,7 @@ pub async fn handle_message(
         &request,
         &client,
         semantic,
-        state.index_db.as_ref(),
+        Some(state.index_db.as_ref()),
         &state.staging,
         &state.timezone,
     )
@@ -761,7 +761,7 @@ pub async fn handle_streamable(
         &request,
         &client,
         semantic,
-        state.index_db.as_ref(),
+        Some(state.index_db.as_ref()),
         &state.staging,
         &state.timezone,
     )

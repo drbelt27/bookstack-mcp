@@ -44,6 +44,9 @@ crates/
     src/oauth.rs         OAuth 2.1 + refresh tokens, login form, token exchange
     src/semantic.rs      Semantic search (calls embedder /embed, queries db), webhook handler
     src/settings_ui.rs   Browser-based /settings form (token-gated via cookie)
+    src/stdio.rs         `--stdio` mode: MCP over stdin/stdout, env-var creds
+                         (BSMCP_BOOKSTACK_TOKEN_ID/SECRET), no DB/port/key;
+                         hides `directory` + `prepare_upload` from tools/list
     src/staging.rs       File staging for upload_image / upload_attachment
     src/migrate.rs       SQLite → PostgreSQL migration tool
 

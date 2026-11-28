@@ -8,6 +8,7 @@ mod settings_ui;
 mod sse;
 mod staging;
 mod status_system;
+mod stdio;
 
 use std::env;
 use std::net::SocketAddr;
@@ -52,6 +53,13 @@ async fn main() {
         // becoming log records.
         run_migration(&args[2..]).await;
         return;
+    }
+
+    // `--stdio`: local MCP over stdin/stdout. Must run before anything that
+    // demands server-only config (encryption key, DB, port); logs go to stderr.
+    if args.iter().skip(1).any(|a| a == "--stdio") {
+        bsmcp_common::logging::init_stderr("bsmcp-server");
+        std::process::exit(stdio::run().await);
     }
 
     bsmcp_common::logging::init("bsmcp-server");

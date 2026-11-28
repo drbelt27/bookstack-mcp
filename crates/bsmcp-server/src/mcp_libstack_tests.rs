@@ -219,7 +219,7 @@ impl Harness {
             &args,
             &self.client,
             None,
-            self.index_db.as_ref(),
+            Some(self.index_db.as_ref()),
             &self.staging,
         )
         .await
